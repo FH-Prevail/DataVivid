@@ -1,0 +1,6 @@
+/target
+/dist
+/testdata
+# Machine-specific cargo settings (e.g. a target-dir outside OneDrive)
+/.cargo/config.toml
+*.datavivid-tmp
