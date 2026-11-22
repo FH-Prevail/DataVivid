@@ -15,6 +15,18 @@ User-facing documentation is in `README.md`.
 
 ## Status (v0.1.0, 2026-11-22)
 
+Published as v0.1.0 on 2026-11-22:
+
+- **Repository:** public, MIT, default branch `main`.
+- **Release:** https://github.com/FH-Prevail/DataVivid/releases/tag/v0.1.0.
+  Its assets are `datavivid.exe` (128.8 MB), `DataVivid-0.1.0-windows-x64.zip`
+  (the exe plus install/uninstall scripts, README and LICENSE) and
+  `SHA256SUMS.txt`.
+- **exe SHA-256:** `84f04461ac623d7d2365a1311b8a274864fb87b6220774960df6647202d93d60`.
+- **Checks:** the exe was built from commit `847c776`. The anonymous download
+  hash matched, and installing from the extracted zip with Windows PowerShell
+  5.1 was tested.
+
 Done and verified on Windows 11:
 
 - **Tests:** 15 unit tests pass (`cargo test`). They cover read/write

@@ -7,7 +7,6 @@ description = "DataVivid - a fast standalone viewer and editor for tabular data 
 authors = ["Prevail Team, FH Steyr"]
 license = "MIT"
 repository = "https://github.com/FH-Prevail/DataVivid"
-homepage = "https://github.com/FH-Prevail/DataVivid"
 readme = "README.md"
 keywords = ["csv", "parquet", "dataframe", "data-wrangling", "viewer"]
 categories = ["gui", "science"]
