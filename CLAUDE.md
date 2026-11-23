@@ -30,6 +30,29 @@ v0.1.1 is the first release built by GitHub Actions
 - **Linux support**, the release workflow and `scripts/package-linux.sh`
   (see the Linux section and the release procedure below).
 
+Published 2026-11-23:
+
+- **Release:** https://github.com/FH-Prevail/DataVivid/releases/tag/v0.1.1.
+  The tag is on `64a77d9`.
+- **Workflow run:** https://github.com/FH-Prevail/DataVivid/actions/runs/45187340177.
+  - Linux took 15 min and Windows 40 min, both cold.
+  - The first run, on `403c6d5`, failed in the Windows smoke test: my
+    `Set-Content` call took the CSV text as the file path. It was fixed in
+    `64a77d9` and the tag was moved there. No release had been created.
+- **SHA-256 of the assets:**
+  - `datavivid.exe`: `4cc877c610a64283d0f7f2989e8804386cd8ecd0525f744ac80106b94485265b`
+  - `DataVivid-0.1.1-windows-x64.zip`: `2cd7f0e04123e136550a70d3bf8ad6d4dfcd96de56d9542c0144e5c146a32fdb`
+  - `datavivid-0.1.1-linux-x64`: `4c1b0244429aec5d2fc2a3837bc3a4944ca98bd30c2b576fa62d77e28c227b6c`
+  - `DataVivid-0.1.1-linux-x64.tar.gz`: `c5f2ac46af57020351330943e22826fd04a075992d9b088ef5c2410cac750fdb`
+- **Checks:**
+  - Anonymous downloads pass `sha256sum -c SHA256SUMS.txt`.
+  - The zip has the same flat five-file layout as v0.1.0.
+  - The Linux tarball installed on the Fedora 43 laptop: the binary reports
+    0.1.1 and is registered, `--convert` works, and copying cells reaches
+    the X clipboard.
+  - The Windows exe was only smoke-tested by CI (`--version`, `--convert`).
+    The GUI and clipboard on Windows are still to be tested by hand.
+
 v0.1.0, published 2026-11-22:
 
 - **Repository:** public, MIT, default branch `main`.
