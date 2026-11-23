@@ -17,6 +17,27 @@ version tag is pushed. The code also builds on macOS (see
 
 ## Download and install (Windows)
 
+**Easiest: the installer.** Download
+`DataVivid-<version>-windows-x64-setup.exe` from the
+[latest release](https://github.com/FH-Prevail/DataVivid/releases/latest) and
+run it.
+
+- It installs for your user only (no admin rights) to
+  `%LOCALAPPDATA%\Programs\DataVivid`, and adds DataVivid to the Start menu
+  (optionally the desktop), to *Settings > Apps* and to Explorer's
+  *Open with* menu for all supported formats.
+- At the end it can open *Settings > Default apps*, so you can make it the
+  default app.
+- **It replaces an older DataVivid:** an install from the zip's
+  `install.ps1`, or one from an earlier setup, is upgraded in place, and a
+  running DataVivid is closed first.
+- Uninstall from *Settings > Apps > DataVivid*.
+
+For scripted installs the setup accepts the usual Inno Setup switches, e.g.
+`DataVivid-<version>-windows-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES`.
+
+The zip and the portable exe are still available:
+
 1. Download from the [latest release](https://github.com/FH-Prevail/DataVivid/releases/latest)
    either
    - `DataVivid-<version>-windows-x64.zip` (exe + install scripts), or
@@ -35,8 +56,8 @@ version tag is pushed. The code also builds on macOS (see
    *Windows > Register DataVivid for data files* (or run
    `datavivid.exe --register`). If you move the exe later, register again.
 
-The exe is not code-signed yet, so Windows SmartScreen may warn on first
-start: choose *More info > Run anyway*. Each release lists SHA-256 checksums
+The setup and the exe are not code-signed yet, so Windows SmartScreen may warn
+on first start: choose *More info > Run anyway*. Each release lists SHA-256 checksums
 you can compare with `Get-FileHash datavivid.exe`.
 
 ### Making it the default app
@@ -281,6 +302,7 @@ Unsigned apps need a right-click > *Open* on first start (Gatekeeper).
 | `scripts/release-linux.sh` | local portable Linux build (Ubuntu 22.04 container) |
 | `scripts/package-linux.sh` | packs the Linux tarball (used by CI and `release-linux.sh`) |
 | `packaging/linux/datavivid.desktop` | desktop entry shipped in the Linux tarball |
+| `packaging/windows/datavivid.iss` | Inno Setup script for the Windows installer |
 | `.github/workflows/release.yml` | builds, tests and publishes releases on `v*` tags |
 | `.github/release-notes/v<ver>.md` | release notes the workflow uses for that tag |
 | `scripts/dev/` | screenshot and input helpers for GUI smoke tests |
@@ -290,7 +312,7 @@ Unsigned apps need a right-click > *Open* on first start (Gatekeeper).
 
 - A tested macOS build with file associations (`Info.plist`), added to the
   release workflow.
-- Signed installer (MSI/MSIX) for Windows.
+- Code-signed Windows installer and exe.
 - Larger-than-memory files via Polars lazy scans and streaming.
 - Exporting the step list as Python (pandas/Polars) code.
 - Joins/merge, pivot, group-by UI, charts.

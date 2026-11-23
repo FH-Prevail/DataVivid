@@ -86,6 +86,77 @@ jobs:
           Copy-Item target\release\datavivid.exe dist\
           Get-ChildItem dist
 
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          function Find-Iscc {
+            Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe" `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress | Out-Null
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "Inno Setup (ISCC.exe) was not found" }
+          Write-Host "Using $($iscc.FullName)"
+          # build.rs writes the icon it embeds into the exe; reuse it for the setup.
+          $ico = Get-ChildItem target\release\build -Recurse -Filter datavivid.ico |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $icoArg = if ($ico) { "/DIconFile=$($ico.FullName)" } else { "/DNoIcon" }
+          & $iscc.FullName /Qp "/DAppVersion=$env:VERSION" "/DSourceDir=$PWD" $icoArg packaging\windows\datavivid.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-ChildItem dist
+
+      - name: Test installer (replace a zip install, upgrade, uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\DataVivid'
+          $exe = Join-Path $dir 'datavivid.exe'
+          $uninst = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+          $oldKey = "$uninst\DataVivid"
+          $newKey = "$uninst\{EEAF0EC4-489A-414E-89DA-9EADC0DD4AF8}_is1"
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'DataVivid.lnk'
+          $setup = (Get-Item "dist\DataVivid-$env:VERSION-windows-x64-setup.exe").FullName
+          $silent = '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          function Check($cond, $msg) { if (-not $cond) { throw "Installer test failed: $msg" }; Write-Host "ok: $msg" }
+          try {
+            # 1. An older install made with the zip's install.ps1.
+            & .\scripts\install.ps1 -Exe target\release\datavivid.exe -NoSettings
+            Check (Test-Path $oldKey) 'install.ps1 created its Settings > Apps entry'
+            Check (Test-Path "$dir\uninstall.ps1") 'install.ps1 left uninstall.ps1'
+
+            # 2. The setup replaces it.
+            $p = Start-Process $setup -ArgumentList ($silent + '/LOG=setup.log') -Wait -PassThru
+            Check ($p.ExitCode -eq 0) "setup exited with 0 (got $($p.ExitCode))"
+            Check (Test-Path $exe) 'datavivid.exe installed'
+            Check (Test-Path "$dir\unins000.exe") 'uninstaller installed'
+            Check (-not (Test-Path "$dir\uninstall.ps1")) 'old uninstall.ps1 removed'
+            Check (-not (Test-Path $oldKey)) 'old Settings > Apps entry removed'
+            Check ((Get-ItemProperty $newKey).DisplayVersion -eq $env:VERSION) "Settings > Apps shows $env:VERSION"
+            Check (Test-Path $lnk) 'Start menu shortcut created'
+            Check ((Get-ItemProperty 'HKCU:\Software\DataVivid').InstallPath -eq $exe) 'file types registered for the installed exe'
+            Check (Test-Path 'HKCU:\Software\Classes\DataVivid.Csv\shell\open\command') 'CSV ProgID registered'
+
+            # 3. Running the setup again (as an upgrade would) keeps one entry.
+            $p = Start-Process $setup -ArgumentList $silent -Wait -PassThru
+            Check ($p.ExitCode -eq 0) 'second run of the setup exited with 0'
+            Check ((Get-ChildItem $uninst | Where-Object { (Get-ItemProperty $_.PSPath).DisplayName -eq 'DataVivid' }).Count -eq 1) 'exactly one DataVivid entry in Settings > Apps'
+
+            # 4. Uninstall. unins000.exe hands over to a temporary copy and
+            #    returns at once, so wait for the files to disappear.
+            Start-Process "$dir\unins000.exe" -ArgumentList $silent -Wait
+            for ($i = 0; $i -lt 90 -and ((Test-Path $exe) -or (Test-Path $newKey)); $i++) { Start-Sleep 1 }
+            Check (-not (Test-Path $exe)) 'exe removed'
+            Check (-not (Test-Path $newKey)) 'Settings > Apps entry removed'
+            Check (-not (Test-Path $lnk)) 'Start menu shortcut removed'
+            Check (-not (Test-Path 'HKCU:\Software\DataVivid')) 'file-type registration removed'
+          } catch {
+            if (Test-Path setup.log) { Write-Host '--- setup.log (last 80 lines)'; Get-Content setup.log -Tail 80 }
+            throw
+          }
+
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-x64

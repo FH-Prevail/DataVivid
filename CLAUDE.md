@@ -14,9 +14,33 @@ User-facing documentation is in `README.md`.
   "Open with" or default app. Linux is supported since 2026-11-23 (same
   single binary, XDG registration); macOS is planned (see README).
 
-## Status (v0.1.1, 2026-11-23)
+## Status (v0.1.2, 2026-11-23)
 
-v0.1.1 is the first release built by GitHub Actions
+v0.1.2 adds a Windows installer; the program itself is unchanged since 0.1.1.
+
+- **Installer:** `packaging/windows/datavivid.iss` (Inno Setup) produces
+  `DataVivid-<ver>-windows-x64-setup.exe`.
+  - It is per user (`PrivilegesRequired=lowest`) and installs into
+    `%LOCALAPPDATA%\Programs\DataVivid`, the folder `install.ps1` uses.
+  - It replaces a zip install: it deletes that install's Settings > Apps key
+    (`HKCU\...\Uninstall\DataVivid`, in `[Code]`) and `uninstall.ps1`.
+  - It closes a running DataVivid through the Restart Manager, runs
+    `datavivid.exe --register` after installing, and its uninstaller runs
+    `--unregister`.
+  - English and German.
+  - The setup icon is the `datavivid.ico` that build.rs writes to OUT_DIR.
+  - **Never change `AppId` {EEAF0EC4-489A-414E-89DA-9EADC0DD4AF8}.** Newer
+    setups find and replace older ones through it, and the CI test checks the
+    matching `..._is1` uninstall key.
+  - The script is UTF-8 **with BOM**, because of the German "für";
+    without the BOM, ISCC would read it as ANSI.
+  - ISCC comes from the runner image, or from `choco install innosetup` if
+    the image lacks it. It cannot be built or tested on the Linux laptop, so
+    the workflow tests it on windows-latest.
+- **Not the other way round:** running `install.ps1` after the setup would
+  give two Settings > Apps entries. The docs recommend the setup.
+
+v0.1.1 was the first release built by GitHub Actions
 (`.github/workflows/release.yml`). Changes since v0.1.0:
 
 - **Clipboard fix:** `Cargo.toml` enabled eframe with
@@ -283,7 +307,12 @@ Releases are built and published by `.github/workflows/release.yml`:
      `--version`/`--convert` through `Start-Process`. It packages
      `DataVivid-<ver>-windows-x64.zip` (a flat zip with exe, install.ps1,
      uninstall.ps1, README.md and LICENSE, the same layout as v0.1.0) plus
-     the bare `datavivid.exe`.
+     the bare `datavivid.exe`. Since 0.1.2 it also builds
+     `DataVivid-<ver>-windows-x64-setup.exe` with Inno Setup and tests it.
+     The test makes an install with `install.ps1`, upgrades it silently with
+     the setup, checks files, registry, shortcut and the single Settings >
+     Apps entry, runs the setup again, then uninstalls and checks that
+     everything is gone.
    - The **ubuntu-22.04** job does the same and runs
      `scripts/package-linux.sh`, which writes the tarball and
      `datavivid-<ver>-linux-x64`.
@@ -295,7 +324,8 @@ Releases are built and published by `.github/workflows/release.yml`:
    already created, also run `gh release delete v<ver> --yes`. Tag and push
    again.
 7. **Verify:**
-   - `gh release view v<ver>` lists all 5 assets.
+   - `gh release view v<ver>` lists all 6 assets: setup, zip, exe, tarball,
+     Linux binary and SHA256SUMS.
    - Download them and run `sha256sum -c SHA256SUMS.txt`.
    - Install the Linux tarball on a Linux machine.
    - The Windows exe can only be smoke-tested by CI. Test it by hand on
@@ -329,4 +359,4 @@ Notes:
 4. Export the steps as Python (pandas/Polars) code; Ops are already a
    replayable recipe.
 5. Group-by, pivot, and join/merge UIs; charts.
-6. Signed MSI/MSIX installer; smaller exe (fat LTO, trimming Polars features).
+6. Code-sign the setup and exe (SmartScreen); smaller exe (fat LTO, trimming Polars features).

@@ -49,7 +49,7 @@ Copy-Item $Exe $target -Force
 Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') (Join-Path $dest 'uninstall.ps1') -Force
 Unblock-File $target -ErrorAction SilentlyContinue  # downloaded exe: drop the "from the internet" mark
 $version = (Get-Item $target).VersionInfo.ProductVersion
-if (-not $version) { $version = '0.1.0' }
+if (-not $version) { $version = 'unknown' }
 
 # Start menu shortcut
 $programs = [Environment]::GetFolderPath('Programs')
