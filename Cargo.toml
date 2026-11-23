@@ -1,6 +1,6 @@
 [package]
 name = "datavivid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "DataVivid - a fast standalone viewer and editor for tabular data files"
@@ -14,7 +14,10 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0"
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+# "clipboard" connects copy/paste to the system clipboard and "links" lets
+# hyperlinks open the browser. Without them (default-features = false) egui
+# keeps a private, in-app clipboard and links do nothing.
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "links", "default_fonts", "glow", "persistence", "x11", "wayland"] }
 egui = "0.37"
 serde = { version = "1.0", features = ["derive"] }
 rfd = "0.18"

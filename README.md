@@ -9,8 +9,11 @@ Originally developed by the **Prevail Team at FH Steyr** (University of
 Applied Sciences Upper Austria). DataVivid is open source under the
 [MIT License](LICENSE): free for everyone to use, change and share.
 
-Releases are available for **Windows** and **Linux** (x64). The code also
-builds on macOS (see [Building for other operating systems](#building-for-other-operating-systems)).
+Releases are available for **Windows** and **Linux** (x64). They are built,
+tested and published by GitHub Actions
+([`.github/workflows/release.yml`](.github/workflows/release.yml)) whenever a
+version tag is pushed. The code also builds on macOS (see
+[Building for other operating systems](#building-for-other-operating-systems)).
 
 ## Download and install (Windows)
 
@@ -58,21 +61,24 @@ both Wayland and X11.
 
 1. Download from the [latest release](https://github.com/FH-Prevail/DataVivid/releases/latest)
    either
-   - `DataVivid-<version>-linux-x64.tar.gz` (binary + install scripts), or
+   - `DataVivid-<version>-linux-x64.tar.gz` (binary, install scripts,
+     `datavivid.desktop`, `datavivid.png`, README, LICENSE), or
    - `datavivid-<version>-linux-x64` alone (portable).
-2. **With the tarball**: unpack it and run the installer
+2. **With the tarball**: unpack it and run the installer (no sudo)
 
    ```bash
    tar xzf DataVivid-<version>-linux-x64.tar.gz
    cd DataVivid-<version>-linux-x64
-   ./install.sh             # or ./install.sh --default
+   ./install.sh             # or ./install.sh --no-default
    ```
 
-   This installs DataVivid for your user only (no root) to
-   `~/.local/bin/datavivid`, adds it to the application menu and to the file
-   manager's *Open with* list for all supported formats. With `--default` it
-   also becomes the default app for CSV, TSV, Parquet, JSON Lines, Arrow, Avro
-   and SQLite files; JSON, Excel and ODS keep their current app.
+   This installs DataVivid for your user only to `~/.local/bin/datavivid`,
+   adds it to the application menu and to the file manager's *Open with* list
+   for all supported formats, and makes it the default app for CSV, TSV,
+   Parquet, JSON Lines, Arrow, Avro and SQLite files. JSON, Excel and ODS keep
+   their current app. With `--no-default` your default apps stay as they are.
+   For a system-wide or hand-made setup, the tarball also has
+   `datavivid.desktop` (`Exec=datavivid %f`) and the 256 px icon.
 3. **Portable binary**: `chmod +x` it, start it and use *Desktop > Register
    DataVivid for data files* (or run `datavivid --register`). If you move the
    binary later, register again.
@@ -216,12 +222,13 @@ sudo apt install build-essential pkg-config
 # 3. Build, test and install for the current user
 cargo test
 cargo build --release            # -> target/release/datavivid
-scripts/install.sh               # copies to ~/.local/bin and registers
+scripts/install.sh               # copies to ~/.local/bin, registers, sets defaults
 ```
 
-`scripts/release-linux.sh` builds the portable release binary inside an
-Ubuntu 22.04 container (podman or docker), so it runs on older distributions
-than the build machine, and packages the tarball in `dist/`.
+Official releases come from the release workflow, which builds on Ubuntu
+22.04. To produce the same tarball locally, `scripts/release-linux.sh` builds
+inside an Ubuntu 22.04 container (podman or docker) and packages the result in
+`dist/` with `scripts/package-linux.sh`.
 
 ### macOS
 
@@ -271,14 +278,18 @@ Unsigned apps need a right-click > *Open* on first start (Gatekeeper).
 | `build.rs` | embeds icon and version info into the Windows exe |
 | `scripts/install.ps1`, `uninstall.ps1` | per-user install/uninstall on Windows |
 | `scripts/install.sh`, `uninstall.sh` | per-user install/uninstall on Linux |
-| `scripts/release-linux.sh` | portable Linux release build (Ubuntu 22.04 container) |
+| `scripts/release-linux.sh` | local portable Linux build (Ubuntu 22.04 container) |
+| `scripts/package-linux.sh` | packs the Linux tarball (used by CI and `release-linux.sh`) |
+| `packaging/linux/datavivid.desktop` | desktop entry shipped in the Linux tarball |
+| `.github/workflows/release.yml` | builds, tests and publishes releases on `v*` tags |
+| `.github/release-notes/v<ver>.md` | release notes the workflow uses for that tag |
 | `scripts/dev/` | screenshot and input helpers for GUI smoke tests |
 | `CLAUDE.md` | working notes for AI coding assistants (architecture, gotchas, status) |
 
 ## Roadmap
 
-- A tested macOS build with file associations (`Info.plist`), and CI release
-  artifacts for all three systems.
+- A tested macOS build with file associations (`Info.plist`), added to the
+  release workflow.
 - Signed installer (MSI/MSIX) for Windows.
 - Larger-than-memory files via Polars lazy scans and streaming.
 - Exporting the step list as Python (pandas/Polars) code.

@@ -1,5 +1,7 @@
 #!/bin/sh
 # Builds the portable Linux release of DataVivid and packages it in dist/.
+# Releases are normally built by .github/workflows/release.yml; this script
+# produces the same files locally, e.g. to test a build before tagging.
 #
 # The binary is built inside an Ubuntu 22.04 container (podman or docker), so
 # it links against glibc 2.35 and runs on Ubuntu 22.04+, Debian 12+,
@@ -8,8 +10,7 @@
 #
 # Output:
 #   dist/datavivid-<ver>-linux-x64                 the bare binary
-#   dist/DataVivid-<ver>-linux-x64.tar.gz          binary + install.sh,
-#                                                  uninstall.sh, README, LICENSE
+#   dist/DataVivid-<ver>-linux-x64.tar.gz          see scripts/package-linux.sh
 #
 # Usage:  scripts/release-linux.sh
 # The cargo registry and target dir are cached in target/linux-portable, so a
@@ -52,13 +53,5 @@ bin="$cache/target/release/datavivid"
 glibc=$(objdump -T "$bin" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1 || true)
 echo "Highest glibc symbol version required: ${glibc:-unknown}"
 
-name="DataVivid-$version-linux-x64"
-stage="$cache/$name"
-rm -rf "$stage"
-mkdir -p "$stage"
-install -m755 "$bin" "$stage/datavivid"
-install -m755 scripts/install.sh scripts/uninstall.sh "$stage/"
-install -m644 README.md LICENSE "$stage/"
-tar -C "$cache" --owner=0 --group=0 -czf "dist/$name.tar.gz" "$name"
-install -m755 "$bin" "dist/datavivid-$version-linux-x64"
-(cd dist && sha256sum "datavivid-$version-linux-x64" "$name.tar.gz")
+scripts/package-linux.sh "$bin"
+(cd dist && sha256sum "datavivid-$version-linux-x64" "DataVivid-$version-linux-x64.tar.gz")

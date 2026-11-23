@@ -14,9 +14,23 @@ User-facing documentation is in `README.md`.
   "Open with" or default app. Linux is supported since 2026-11-23 (same
   single binary, XDG registration); macOS is planned (see README).
 
-## Status (v0.1.0, 2026-11-22)
+## Status (v0.1.1, 2026-11-23)
 
-Published as v0.1.0 on 2026-11-22:
+v0.1.1 is the first release built by GitHub Actions
+(`.github/workflows/release.yml`). Changes since v0.1.0:
+
+- **Clipboard fix:** `Cargo.toml` enabled eframe with
+  `default-features = false` but without the `clipboard` and `links`
+  features. egui then keeps copied text in a private in-app clipboard, so
+  Ctrl+C never reached other apps (the status bar still said "Copied N
+  cell(s)"). Pasting from other apps also failed, and Help > About's link did
+  nothing. Both features are now on. On Linux they add only pure-Rust crates
+  (arboard via x11rb, smithay-clipboard, webbrowser), so no new system
+  libraries are needed. **Keep both features when touching the eframe line.**
+- **Linux support**, the release workflow and `scripts/package-linux.sh`
+  (see the Linux section and the release procedure below).
+
+v0.1.0, published 2026-11-22:
 
 - **Repository:** public, MIT, default branch `main`.
 - **Release:** https://github.com/FH-Prevail/DataVivid/releases/tag/v0.1.0.
@@ -66,10 +80,33 @@ Linux (added 2026-11-23, verified on Fedora 43, i3 on X11):
   (desktop entry passes `desktop-file-validate`, GIO detects Parquet, Arrow,
   Avro and JSON Lines by extension and by magic bytes, and `--unregister`
   removes only DataVivid's lines from `mimeapps.list`).
-- **Release asset:** built by `scripts/release-linux.sh` in an Ubuntu 22.04
-  container, so it needs glibc 2.35 or newer. It was attached to the v0.1.0
-  release; that build includes the Linux integration commit, which came
-  after the `v0.1.0` tag.
+- **Clipboard and links (v0.1.1, X11):**
+  - With the 0.1.0 build, Ctrl+C left the X clipboard unchanged (checked with
+    `xclip -o -selection clipboard`).
+  - With the fix, copying 3x3 cells gives tab-separated rows with UTF-8
+    intact ("Möbel").
+  - Text put on the clipboard with `xclip` pastes into the grid ("Edit 2
+    cells in …").
+  - Help > About's link calls the browser: tested with `BROWSER` pointing at
+    a logging script, which received `https://github.com/FH-Prevail/DataVivid`.
+  - Wayland (`wl-paste`) was not tested, because this laptop runs i3 on X11.
+- **Release assets:** built by the workflow on `ubuntu-22.04`, so they need
+  glibc 2.35 or newer. A preview Linux build was attached to the v0.1.0
+  release on 2026-11-23. It was built from `03e495b`, after the `v0.1.0` tag.
+- **Decisions made against the original brief** (noted for the maintainer):
+  - `--register` on Linux really registers (desktop entry, icons, MIME
+    types) instead of printing a hint to the README. It was already
+    implemented and tested before the brief arrived.
+  - `install.sh` uses `datavivid --register`, not the static desktop file.
+    That entry's `Exec` holds the absolute binary path, so it works even when
+    `~/.local/bin` is not on the GUI session's PATH. The tarball still ships
+    `packaging/linux/datavivid.desktop` (`Exec=datavivid %f`) and the 256 px
+    PNG for system-wide or manual setups.
+  - `install.sh` sets the default apps unless given `--no-default`.
+    `--default` is still accepted.
+  - CI runs `cargo test --release --locked` rather than `cargo test --locked`.
+    It reuses the release build's dependencies instead of compiling Polars a
+    second time in the dev profile.
 
 Not done or known gaps:
 
@@ -207,30 +244,62 @@ linked to the FH-Prevail GitHub account, so GitHub credits the commits to it.
 The first two commits used `p42872@fhooe.at`, which no GitHub account claims,
 so GitHub shows them without an author.
 
-1. Bump `version` in `Cargo.toml`, then run `cargo test` and
-   `cargo build --release`.
-2. Package `DataVivid-<ver>-windows-x64.zip` containing `datavivid.exe`,
-   `install.ps1`, `uninstall.ps1`, `README.md` and `LICENSE`.
-   `install.ps1` picks up the exe next to it.
-3. Write `SHA256SUMS.txt` for the exe and the zip.
-4. Tag `v<ver>` and create the GitHub release with the exe, zip and checksums
-   as assets.
-5. **Linux, from a Linux machine with podman or docker:** run
-   `scripts/release-linux.sh`. It writes `dist/datavivid-<ver>-linux-x64`
-   and `dist/DataVivid-<ver>-linux-x64.tar.gz` (the binary, `install.sh`,
-   `uninstall.sh`, README and LICENSE) and prints their SHA-256. Add both
-   files to the release and both hashes to `SHA256SUMS.txt`. A rerun only
-   recompiles DataVivid, because the cache is in `target/linux-portable`.
-6. Without the `gh` CLI, use the REST API:
-   - Get a token from `git credential fill`. Never print or store it.
-   - `POST /repos/FH-Prevail/DataVivid/releases`, then upload the assets to
-     `uploads.github.com/.../releases/<id>/assets?name=…` with
-     `Content-Type: application/octet-stream`.
+Releases are built and published by `.github/workflows/release.yml`:
+
+1. Bump `version` in `Cargo.toml` and run `cargo update -p datavivid`, so
+   `Cargo.lock` matches. CI builds with `--locked`.
+2. Write `.github/release-notes/v<ver>.md`; the workflow appends the
+   checksums. Without the file the notes are only a title line.
+3. Run `cargo test`, commit and push `main`.
+4. `git tag v<ver> && git push origin v<ver>`. The tag must equal the
+   `Cargo.toml` version, otherwise both build jobs fail at once.
+5. Watch the run: `gh run list --workflow release.yml -L 1`, then
+   `gh run watch <id> --exit-status`. A cold run takes about 30–40 min,
+   because Windows is the slow job.
+   - The **windows-latest** job builds, tests and smoke-tests
+     `--version`/`--convert` through `Start-Process`. It packages
+     `DataVivid-<ver>-windows-x64.zip` (a flat zip with exe, install.ps1,
+     uninstall.ps1, README.md and LICENSE, the same layout as v0.1.0) plus
+     the bare `datavivid.exe`.
+   - The **ubuntu-22.04** job does the same and runs
+     `scripts/package-linux.sh`, which writes the tarball and
+     `datavivid-<ver>-linux-x64`.
+   - The **release** job writes `SHA256SUMS.txt` and runs
+     `gh release create` with `GITHUB_TOKEN`. If the release already exists,
+     it runs `upload --clobber` and `edit` instead, so a rerun is safe.
+6. **If the run fails:** fix it, push `main`, then move the tag:
+   `git tag -d v<ver>; git push origin :refs/tags/v<ver>`. If a release was
+   already created, also run `gh release delete v<ver> --yes`. Tag and push
+   again.
+7. **Verify:**
+   - `gh release view v<ver>` lists all 5 assets.
+   - Download them and run `sha256sum -c SHA256SUMS.txt`.
+   - Install the Linux tarball on a Linux machine.
+   - The Windows exe can only be smoke-tested by CI. Test it by hand on
+     Windows.
+
+Notes:
+
+- **Caches:** GitHub does not share Actions caches between tags. A cache
+  saved on `v0.1.1` is invisible to `v0.1.2`, but caches from `main` are
+  visible to every tag. Running the workflow by hand on `main` (Actions >
+  Release > Run workflow) builds and tests without releasing, and warms that
+  cache. Do it before tagging.
+- **Action versions:** every action is pinned to a version tag. Bump them
+  deliberately.
+- **Local Linux build:** `scripts/release-linux.sh` builds the same Linux
+  files in an Ubuntu 22.04 container, which is handy for testing before
+  tagging.
+- **Don't run two podman containers with `:Z` mounts of this repo at the same
+  time.** Each relabels the tree for SELinux and locks the other out of the
+  cargo cache. A parallel actionlint run broke a build this way.
+- **Without the `gh` CLI:** use the REST API. Get a token from
+  `git credential fill`, and never print or store it.
 
 ## Next steps (ideas, roughly by value)
 
-1. CI (GitHub Actions) building Windows, macOS and Linux artifacts; then
-   macOS `.app` (cargo-bundle, `CFBundleDocumentTypes`).
+1. A macOS job in the release workflow, then a macOS `.app` (cargo-bundle,
+   `CFBundleDocumentTypes`).
 2. Keep the cell editor open on invalid input instead of moving down.
 3. Lazy or streaming open for files larger than RAM (Polars `scan_*`), with
    the grid reading slices.

@@ -1,0 +1,197 @@
+# Builds DataVivid for Windows and Linux and publishes a GitHub release.
+#
+# - Pushing a tag v<version> (it must match Cargo.toml) builds, tests,
+#   packages and creates the release with all files and SHA256SUMS.txt.
+# - Running it by hand (Actions > Release > Run workflow) on a branch only
+#   builds and tests, and keeps the packages as workflow artifacts. Run it on
+#   main now and then: GitHub caches made on a tag are not visible to later
+#   tags, but caches made on main are, so this keeps release builds fast.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install Rust (stable)
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      - name: Read the version (and check it matches the tag)
+        shell: bash
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          # The release exe is a GUI-subsystem program, so run it through
+          # Start-Process to wait for it and capture its output.
+          $p = Start-Process target\release\datavivid.exe -ArgumentList '--version' `
+                 -Wait -PassThru -NoNewWindow -RedirectStandardOutput version.txt
+          $out = (Get-Content version.txt -Raw).Trim()
+          Write-Host "datavivid.exe --version: '$out' (exit $($p.ExitCode))"
+          if ($p.ExitCode -ne 0 -or $out -ne "DataVivid $env:VERSION") { throw "--version smoke test failed" }
+
+          Set-Content -NoNewline smoke.csv "id,name`n1,a`n2,b`n"
+          $p = Start-Process target\release\datavivid.exe -ArgumentList '--convert','smoke.csv','smoke.parquet' `
+                 -Wait -PassThru -NoNewWindow -RedirectStandardOutput convert.txt
+          Get-Content convert.txt
+          if ($p.ExitCode -ne 0 -or -not (Test-Path smoke.parquet)) { throw "--convert smoke test failed" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist, pkg | Out-Null
+          Copy-Item target\release\datavivid.exe, scripts\install.ps1, scripts\uninstall.ps1, README.md, LICENSE pkg\
+          Compress-Archive -Path pkg\* -DestinationPath "dist\DataVivid-$env:VERSION-windows-x64.zip"
+          Copy-Item target\release\datavivid.exe dist\
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64
+    # The oldest available runner: binaries built here need only glibc 2.35,
+    # so they run on Ubuntu 22.04+, Debian 12+, Fedora 36+ and similar.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install build packages
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential pkg-config
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      - name: Read the version (and check it matches the tag)
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $ver"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Smoke test
+        run: |
+          bin=target/release/datavivid
+          out=$("$bin" --version)
+          echo "datavivid --version: $out"
+          [ "$out" = "DataVivid $VERSION" ]
+          printf 'id,name\n1,a\n2,b\n' > smoke.csv
+          "$bin" --convert smoke.csv smoke.parquet
+          test -s smoke.parquet
+          echo "Highest glibc symbol version: $(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+
+      - name: Package
+        run: |
+          scripts/package-linux.sh target/release/datavivid
+          tar -tzvf "dist/DataVivid-$VERSION-linux-x64.tar.gz"
+
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: linux-x64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release notes
+        run: |
+          notes=".github/release-notes/$TAG.md"
+          {
+            if [ -f "$notes" ]; then cat "$notes"; else echo "DataVivid ${TAG#v}."; fi
+            echo
+            echo "## Checksums (SHA-256)"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } > notes.md
+
+      - name: Create or update the release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "DataVivid ${TAG#v}" --notes-file notes.md
+          fi
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)  \(.size)"'

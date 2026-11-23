@@ -5,19 +5,23 @@
 #     or builds it with cargo when run from the repository
 #   - copies it to ~/.local/bin (or $DATAVIVID_BIN_DIR)
 #   - adds it to the application menu and to the file manager's "Open with"
-#     list (datavivid --register)
-#   - with --default, also makes it the default app for CSV, TSV, Parquet,
-#     JSON Lines, Arrow, Avro and SQLite files
+#     list (datavivid --register writes ~/.local/share/applications,
+#     ~/.local/share/icons and the MIME types, then runs
+#     update-desktop-database and update-mime-database)
+#   - makes it the default app for CSV, TSV, Parquet, JSON Lines, Arrow, Avro
+#     and SQLite files (xdg-mime default); JSON, Excel and ODS keep their
+#     current app. Pass --no-default to skip this step.
 #
-# Usage:  ./install.sh [--default]
+# Usage:  ./install.sh [--no-default]
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-make_default=0
+make_default=1
 for arg in "$@"; do
     case "$arg" in
-        --default) make_default=1 ;;
-        -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+        --no-default) make_default=0 ;;
+        --default) make_default=1 ;;  # accepted for compatibility
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
 done
