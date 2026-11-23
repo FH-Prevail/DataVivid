@@ -39,6 +39,10 @@ jobs:
           rustc --version
 
       - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          # Keep the compiled dependencies even when a later step fails, so a
+          # fixed rerun does not rebuild Polars from scratch.
+          cache-on-failure: true
 
       - name: Read the version (and check it matches the tag)
         shell: bash
@@ -67,7 +71,7 @@ jobs:
           Write-Host "datavivid.exe --version: '$out' (exit $($p.ExitCode))"
           if ($p.ExitCode -ne 0 -or $out -ne "DataVivid $env:VERSION") { throw "--version smoke test failed" }
 
-          Set-Content -NoNewline smoke.csv "id,name`n1,a`n2,b`n"
+          Set-Content -Path smoke.csv -Value "id,name`n1,a`n2,b`n" -NoNewline
           $p = Start-Process target\release\datavivid.exe -ArgumentList '--convert','smoke.csv','smoke.parquet' `
                  -Wait -PassThru -NoNewWindow -RedirectStandardOutput convert.txt
           Get-Content convert.txt
@@ -109,6 +113,10 @@ jobs:
           rustc --version
 
       - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          # Keep the compiled dependencies even when a later step fails, so a
+          # fixed rerun does not rebuild Polars from scratch.
+          cache-on-failure: true
 
       - name: Read the version (and check it matches the tag)
         run: |
