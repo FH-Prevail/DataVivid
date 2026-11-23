@@ -27,7 +27,9 @@ pub fn run(file: Option<PathBuf>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DataVivid")
-            .with_app_id("DataVivid")
+            // Linux: the app_id must match datavivid.desktop for the icon and
+            // name. Elsewhere it also names the settings folder, so keep it.
+            .with_app_id(if cfg!(target_os = "linux") { winassoc::LINUX_APP_ID } else { "DataVivid" })
             .with_inner_size([1360.0, 840.0])
             .with_min_inner_size([720.0, 420.0])
             .with_icon(Arc::new(icon))
@@ -1024,7 +1026,7 @@ impl App {
                 }
             });
 
-            ui.menu_button("Windows", |ui| {
+            ui.menu_button(if cfg!(windows) { "Windows" } else { "Desktop" }, |ui| {
                 self.windows_menu(ui);
             });
 
@@ -1073,27 +1075,39 @@ impl App {
         } else {
             "Register DataVivid for data files"
         };
-        if ui.button(label).on_hover_text(
-            "Adds DataVivid to Explorer's \"Open with\" menu and to Settings > Default apps \
-             for CSV, TSV, Parquet, JSON, Arrow, Avro, Excel, ODS and SQLite. No admin rights needed.",
-        ).clicked() {
+        let (register_hint, registered_msg, default_label, default_hint) = if cfg!(windows) {
+            (
+                "Adds DataVivid to Explorer's \"Open with\" menu and to Settings > Default apps \
+                 for CSV, TSV, Parquet, JSON, Arrow, Avro, Excel, ODS and SQLite. No admin rights needed.",
+                "Registered. Choose DataVivid as default in the Default apps page.",
+                "Choose DataVivid as default app…",
+                "Windows only lets you pick default apps yourself. This opens Settings > Default apps on DataVivid's page.",
+            )
+        } else {
+            (
+                "Adds DataVivid to the application menu and to the file manager's \"Open with\" list \
+                 for CSV, TSV, Parquet, JSON, Arrow, Avro, Excel, ODS and SQLite (current user only, no root).",
+                "Registered. DataVivid now appears in the application menu and under Open with.",
+                "Make DataVivid the default app",
+                "Opens CSV, TSV, Parquet, JSON Lines, Arrow, Avro and SQLite files with DataVivid on double-click. \
+                 JSON, Excel and ODS keep their current app.",
+            )
+        };
+        if ui.button(label).on_hover_text(register_hint).clicked() {
             match winassoc::register() {
-                Ok(()) => self.info("Registered. Choose DataVivid as default in the Default apps page."),
+                Ok(()) => self.info(registered_msg),
                 Err(e) => self.error(format!("Registration failed: {e}")),
             }
             self.reg_status = winassoc::status();
             ui.close();
         }
-        if ui.button("Choose DataVivid as default app…").on_hover_text(
-            "Windows only lets you pick default apps yourself. This opens Settings > Default apps on DataVivid's page.",
-        ).clicked() {
-            if self.reg_status == winassoc::Status::NotRegistered {
-                let _ = winassoc::register();
-                self.reg_status = winassoc::status();
+        if ui.button(default_label).on_hover_text(default_hint).clicked() {
+            match winassoc::choose_defaults() {
+                Ok(()) if !cfg!(windows) => self.info("DataVivid is now the default app for data files."),
+                Ok(()) => {}
+                Err(e) => self.error(format!("Could not set the default app: {e}")),
             }
-            if let Err(e) = winassoc::open_default_apps_settings() {
-                self.error(format!("Could not open Settings: {e}"));
-            }
+            self.reg_status = winassoc::status();
             ui.close();
         }
         if ui.add_enabled(self.reg_status != winassoc::Status::NotRegistered, egui::Button::new("Remove registration")).clicked() {
@@ -1320,10 +1334,17 @@ impl App {
                     .weak(),
                 );
                 ui.add_space(22.0);
-                if cfg!(windows) && self.reg_status != winassoc::Status::Registered {
+                if (cfg!(windows) || cfg!(target_os = "linux")) && self.reg_status != winassoc::Status::Registered {
                     egui::Frame::group(ui.style()).inner_margin(12.0).show(ui, |ui| {
                         ui.set_max_width(520.0);
-                        ui.label(RichText::new("Open data files from Explorer").strong());
+                        ui.label(
+                            RichText::new(if cfg!(windows) {
+                                "Open data files from Explorer"
+                            } else {
+                                "Open data files from your file manager"
+                            })
+                            .strong(),
+                        );
                         ui.label(
                             "Register DataVivid so it appears in \"Open with\" for CSV, Parquet, Excel and the \
                              other formats, then pick it as the default app.",
@@ -1336,12 +1357,20 @@ impl App {
                                 }
                                 self.reg_status = winassoc::status();
                             }
-                            if ui.button("Register and choose defaults…").clicked() {
-                                let _ = winassoc::register();
-                                self.reg_status = winassoc::status();
-                                if let Err(e) = winassoc::open_default_apps_settings() {
-                                    self.error(format!("Could not open Settings: {e}"));
+                            let label = if cfg!(windows) {
+                                "Register and choose defaults…"
+                            } else {
+                                "Register and make default"
+                            };
+                            if ui.button(label).clicked() {
+                                match winassoc::choose_defaults() {
+                                    Ok(()) if !cfg!(windows) => {
+                                        self.info("DataVivid is now the default app for data files.")
+                                    }
+                                    Ok(()) => {}
+                                    Err(e) => self.error(format!("Could not set the default app: {e}")),
                                 }
+                                self.reg_status = winassoc::status();
                             }
                         });
                     });

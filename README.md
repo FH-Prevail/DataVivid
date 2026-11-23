@@ -9,8 +9,8 @@ Originally developed by the **Prevail Team at FH Steyr** (University of
 Applied Sciences Upper Austria). DataVivid is open source under the
 [MIT License](LICENSE): free for everyone to use, change and share.
 
-Windows is the primary platform. The code also builds on macOS and Linux
-(see [Building for other operating systems](#building-for-other-operating-systems)).
+Releases are available for **Windows** and **Linux** (x64). The code also
+builds on macOS (see [Building for other operating systems](#building-for-other-operating-systems)).
 
 ## Download and install (Windows)
 
@@ -49,6 +49,45 @@ that choice is always yours. After registration either
 
 Uninstall via *Settings > Apps > DataVivid*, or run
 `datavivid.exe --unregister` for the portable exe.
+
+## Download and install (Linux)
+
+The Linux build runs on x64 distributions with glibc 2.35 or newer: Ubuntu
+22.04+, Debian 12+, Fedora 36+, Linux Mint 21+ and others of that age, on
+both Wayland and X11.
+
+1. Download from the [latest release](https://github.com/FH-Prevail/DataVivid/releases/latest)
+   either
+   - `DataVivid-<version>-linux-x64.tar.gz` (binary + install scripts), or
+   - `datavivid-<version>-linux-x64` alone (portable).
+2. **With the tarball**: unpack it and run the installer
+
+   ```bash
+   tar xzf DataVivid-<version>-linux-x64.tar.gz
+   cd DataVivid-<version>-linux-x64
+   ./install.sh             # or ./install.sh --default
+   ```
+
+   This installs DataVivid for your user only (no root) to
+   `~/.local/bin/datavivid`, adds it to the application menu and to the file
+   manager's *Open with* list for all supported formats. With `--default` it
+   also becomes the default app for CSV, TSV, Parquet, JSON Lines, Arrow, Avro
+   and SQLite files; JSON, Excel and ODS keep their current app.
+3. **Portable binary**: `chmod +x` it, start it and use *Desktop > Register
+   DataVivid for data files* (or run `datavivid --register`). If you move the
+   binary later, register again.
+
+What `--register` writes, all under `~/.local/share`: the desktop entry
+`applications/datavivid.desktop`, the icon in `icons/hicolor/*/apps/`, and
+`mime/packages/datavivid.xml`, which teaches the desktop the Parquet,
+Arrow/Feather, Avro and JSON Lines file types. `--make-default` (or *Desktop >
+Make DataVivid the default app*) runs `xdg-mime default`. `--unregister`, or
+`~/.local/share/datavivid/uninstall.sh` after a tarball install, removes all of
+it again.
+
+File dialogs use the XDG desktop portal, which GNOME, KDE and most other
+desktops install by default (otherwise install `xdg-desktop-portal` plus
+`xdg-desktop-portal-gtk` or `-kde`).
 
 ## Formats
 
@@ -109,13 +148,14 @@ as Parquet in about 0.15 s.
 ```text
 datavivid [FILE]                          open a file
 datavivid --register                      "Open with" + Default apps entries (current user)
+datavivid --make-default                  Linux only: also become the default app for data files
 datavivid --unregister                    remove them again
 datavivid --status                        show the registration status
 datavivid --convert in.csv out.parquet    headless conversion (format from extension)
 datavivid --help | --version
 ```
 
-What `--register` writes (all under `HKEY_CURRENT_USER`): one ProgID per
+On Windows, what `--register` writes (all under `HKEY_CURRENT_USER`): one ProgID per
 format (`Software\Classes\DataVivid.Csv`, `…Parquet`, …) with icon and open
 command, the ProgIDs under each extension's `OpenWithProgids`,
 `Software\Classes\Applications\datavivid.exe` with `SupportedTypes`, and
@@ -149,18 +189,19 @@ target-dir = "C:/Users/<you>/AppData/Local/datavivid-target"
 
 ## Building for other operating systems
 
-DataVivid is plain Rust and all dependencies are cross-platform. Only the file
-type registration (`src/winassoc.rs`) is Windows-specific; on other systems
-the *Windows* menu reports that registration is not available and file
-associations are set up as described below.
+DataVivid is plain Rust and all dependencies are cross-platform. File type
+registration is implemented for Windows (registry, `src/winassoc.rs`) and
+Linux (XDG desktop entry and MIME types, `src/linuxassoc.rs`); on macOS the
+*Desktop* menu reports that registration is not available and file
+associations come from the app bundle described below.
 
 **Build natively on each operating system.** Cross-compiling from Windows is
 not practical because Polars, SQLite (bundled) and zstd compile C code for the
 target. For automated builds use a CI runner per OS (e.g. GitHub Actions
 `windows-latest`, `macos-latest`, `ubuntu-latest`).
 
-> Status: Windows is built and tested by the maintainers. macOS and Linux
-> builds follow the steps below but have not been tested yet; reports and
+> Status: Windows and Linux are built and tested by the maintainers. The
+> macOS build follows the steps below but has not been tested yet; reports and
 > pull requests are welcome.
 
 ### Linux
@@ -168,35 +209,19 @@ target. For automated builds use a CI runner per OS (e.g. GitHub Actions
 ```bash
 # 1. Toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# 2. System libraries (Debian/Ubuntu; use the equivalent packages elsewhere)
-sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev \
-     libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
-# 3. Build
+# 2. A C compiler (Debian/Ubuntu; use the equivalent packages elsewhere).
+#    The window system libraries (Wayland, X11, xkbcommon, OpenGL) are loaded
+#    at run time, so no -dev packages are needed.
+sudo apt install build-essential pkg-config
+# 3. Build, test and install for the current user
+cargo test
 cargo build --release            # -> target/release/datavivid
+scripts/install.sh               # copies to ~/.local/bin and registers
 ```
 
-File dialogs use the XDG desktop portal (installed by default on GNOME/KDE;
-otherwise install `xdg-desktop-portal` plus `xdg-desktop-portal-gtk` or
-`-kde`).
-
-To get "Open with" and default-app support, install the binary and a desktop
-entry:
-
-```bash
-install -Dm755 target/release/datavivid ~/.local/bin/datavivid
-cat > ~/.local/share/applications/datavivid.desktop <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=DataVivid
-Comment=View, clean and convert tabular data
-Exec=datavivid %f
-Terminal=false
-Categories=Office;Science;Development;
-MimeType=text/csv;text/tab-separated-values;application/vnd.apache.parquet;application/json;application/x-ndjson;application/vnd.apache.arrow.file;application/vnd.ms-excel;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.oasis.opendocument.spreadsheet;application/vnd.sqlite3;
-EOF
-update-desktop-database ~/.local/share/applications
-xdg-mime default datavivid.desktop text/csv     # optional: make it the default for CSV
-```
+`scripts/release-linux.sh` builds the portable release binary inside an
+Ubuntu 22.04 container (podman or docker), so it runs on older distributions
+than the build machine, and packages the tarball in `dist/`.
 
 ### macOS
 
@@ -240,17 +265,20 @@ Unsigned apps need a right-click > *Open* on first start (Gatekeeper).
 | `src/io.rs` | readers/writers, CSV sniffing, encodings, safe save |
 | `src/stats.rs` | column profiles for headers and the summary panel |
 | `src/formats.rs` | format/extension table |
-| `src/winassoc.rs` | Windows file-type registration (HKCU) |
+| `src/winassoc.rs` | file-type registration: Windows (HKCU) and the shared API |
+| `src/linuxassoc.rs` | file-type registration on Linux (desktop entry, icons, MIME) |
 | `src/icon_art.rs` | procedural app icon (window + embedded `.ico`) |
 | `build.rs` | embeds icon and version info into the Windows exe |
 | `scripts/install.ps1`, `uninstall.ps1` | per-user install/uninstall on Windows |
+| `scripts/install.sh`, `uninstall.sh` | per-user install/uninstall on Linux |
+| `scripts/release-linux.sh` | portable Linux release build (Ubuntu 22.04 container) |
 | `scripts/dev/` | screenshot and input helpers for GUI smoke tests |
 | `CLAUDE.md` | working notes for AI coding assistants (architecture, gotchas, status) |
 
 ## Roadmap
 
-- Tested macOS and Linux builds, with file associations (`.desktop`/MIME,
-  `Info.plist`) and CI release artifacts for all three systems.
+- A tested macOS build with file associations (`Info.plist`), and CI release
+  artifacts for all three systems.
 - Signed installer (MSI/MSIX) for Windows.
 - Larger-than-memory files via Polars lazy scans and streaming.
 - Exporting the step list as Python (pandas/Polars) code.

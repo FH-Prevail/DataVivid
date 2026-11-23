@@ -16,12 +16,21 @@
 //! The user then picks DataVivid as the default, either in "Open with >
 //! Choose another app > Always" or in the Default apps page that
 //! [`open_default_apps_settings`] opens.
+//!
+//! On Linux the same API is implemented in `linuxassoc.rs` with an XDG
+//! desktop entry, icons and a MIME package; other systems get stubs.
 
+#[allow(unused_imports)]
 use crate::formats::Format;
 
 pub const APP_NAME: &str = "DataVivid";
+#[cfg(windows)]
 const EXE_NAME: &str = "datavivid.exe";
+#[cfg(windows)]
 const CAPABILITIES: &str = r"Software\DataVivid\Capabilities";
+/// Wayland app_id / X11 WM_CLASS on Linux; matches `datavivid.desktop`, so
+/// the desktop shows DataVivid's icon and name for the window.
+pub const LINUX_APP_ID: &str = "datavivid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -173,6 +182,15 @@ mod imp {
         open_uri("ms-settings:defaultapps?registeredAppUser=DataVivid")
     }
 
+    /// Windows only lets the user pick defaults: register if needed, then
+    /// open Settings > Default apps.
+    pub fn choose_defaults() -> io::Result<()> {
+        if status() == Status::NotRegistered {
+            register()?;
+        }
+        open_default_apps_settings()
+    }
+
     fn open_uri(uri: &str) -> io::Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -184,13 +202,20 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+#[path = "linuxassoc.rs"]
+mod imp;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     use super::*;
     use std::io;
 
     fn unsupported() -> io::Error {
-        io::Error::new(io::ErrorKind::Unsupported, "file registration is only implemented on Windows")
+        io::Error::new(io::ErrorKind::Unsupported, "file registration is only implemented on Windows and Linux")
+    }
+    pub fn choose_defaults() -> io::Result<()> {
+        Err(unsupported())
     }
     pub fn register() -> io::Result<()> {
         Err(unsupported())
@@ -201,12 +226,9 @@ mod imp {
     pub fn status() -> Status {
         Status::NotRegistered
     }
-    pub fn open_default_apps_settings() -> io::Result<()> {
-        Err(unsupported())
-    }
 }
 
-pub use imp::{open_default_apps_settings, register, status, unregister};
+pub use imp::{choose_defaults, register, status, unregister};
 
 /// If DataVivid is registered for an executable that no longer exists (it was
 /// moved or deleted), point the registration at this executable. A second,

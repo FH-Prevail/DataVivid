@@ -11,7 +11,8 @@ User-facing documentation is in `README.md`.
 - Origin: Prevail Team, FH Steyr (University of Applied Sciences Upper
   Austria). License: MIT (`LICENSE`). Repo: https://github.com/FH-Prevail/DataVivid
 - Windows first. It must be a single exe that can be registered as an
-  "Open with" or default app. macOS and Linux builds are planned (see README).
+  "Open with" or default app. Linux is supported since 2026-11-23 (same
+  single binary, XDG registration); macOS is planned (see README).
 
 ## Status (v0.1.0, 2026-11-22)
 
@@ -51,11 +52,31 @@ Done and verified on Windows 11:
   keys are correct, existing OpenWithProgids were kept, and opening a file
   through the registered command works.
 
+Linux (added 2026-11-23, verified on Fedora 43, i3 on X11):
+
+- **Build:** a cold `cargo build --release` takes about 3.5 min on a 20-core
+  laptop; only a C compiler is needed. winit and glow load Wayland, X11,
+  xkbcommon and OpenGL at run time, so no `-dev` packages are required.
+- **Tests:** all 19 unit tests pass (`cargo test`), including the 4 Linux
+  ones in `linuxassoc.rs`.
+- **Checked by hand:** `--convert` (1M-row CSV to Parquet in 0.5 s); the GUI
+  opens the 1M-row CSV in about 0.56 s; the window class is `datavivid`; File
+  > Open shows the GTK portal dialog with the format filter;
+  `--register/--make-default/--unregister` against a scratch `XDG_DATA_HOME`
+  (desktop entry passes `desktop-file-validate`, GIO detects Parquet, Arrow,
+  Avro and JSON Lines by extension and by magic bytes, and `--unregister`
+  removes only DataVivid's lines from `mimeapps.list`).
+- **Release asset:** built by `scripts/release-linux.sh` in an Ubuntu 22.04
+  container, so it needs glibc 2.35 or newer. It was attached to the v0.1.0
+  release; that build includes the Linux integration commit, which came
+  after the `v0.1.0` tag.
+
 Not done or known gaps:
 
-- **Other platforms:** macOS and Linux builds are untested. The code is
-  `cfg`-gated: `winassoc.rs` has stubs and `build.rs` only embeds resources on
-  Windows.
+- **macOS:** untested. `winassoc.rs` has stubs there, and `build.rs` only
+  embeds resources on Windows.
+- **Linux on Wayland and other desktops:** only tested on i3/X11. GNOME and KDE
+  should match the window to `datavivid.desktop` through the app_id.
 - **Code signing:** none. SmartScreen warns on first start of a downloaded exe.
 - **Memory:** whole files are loaded into memory; there are no lazy scans yet.
 - **Invalid edits:** after an invalid cell edit, Enter still moves the cursor
@@ -77,7 +98,8 @@ Not done or known gaps:
 | `io.rs` | `load(LoadRequest) -> Loaded` and `save(df, path, SaveOptions)`. See the delimited-text, spreadsheet and SQLite notes below this table. |
 | `stats.rs` | `ColumnProfile`: missing, distinct, quantiles, mean/std, histogram (one bin per value for small integer ranges), top values, min/max, text length. Computed in a background thread per history version, selected column first; stale runs cancel via an `AtomicU64` generation. |
 | `formats.rs` | Format enum ↔ extensions, labels, ProgID keys, `can_write`. |
-| `winassoc.rs` | HKCU-only registration: ProgID per format, `OpenWithProgids`, `Applications\datavivid.exe\SupportedTypes`, `Software\DataVivid\Capabilities` + `RegisteredApplications`, `SHChangeNotify`. Never touches `UserChoice` (Windows forbids it; the user picks the default in Settings). `refresh_if_moved` re-registers only if the registered exe path no longer exists. |
+| `linuxassoc.rs` | Linux implementation of the `winassoc` API (pulled in with `#[path]` as `winassoc::imp`). It writes `$XDG_DATA_HOME/applications/datavivid.desktop` (with an `X-DataVivid-Path` key for `status()`), PNG icons into `icons/hicolor` (its own small PNG encoder using flate2), and `mime/packages/datavivid.xml` for Parquet, Arrow, Avro, JSON Lines and `*.sqlite`, then runs the update-*-database tools. `choose_defaults()` runs `xdg-mime default` for `DEFAULT_MIME` (not JSON, Excel or ODS). On Linux the app_id is `datavivid` (`winassoc::LINUX_APP_ID`), so settings live in `~/.local/share/datavivid`. Never put `--` inside the XML comment, because update-mime-database rejects the whole file (a test guards this). |
+| `winassoc.rs` | Shared registration API (`register/unregister/status/choose_defaults`). On Windows it does HKCU-only registration: ProgID per format, `OpenWithProgids`, `Applications\datavivid.exe\SupportedTypes`, `Software\DataVivid\Capabilities` + `RegisteredApplications`, `SHChangeNotify`. Never touches `UserChoice` (Windows forbids it; the user picks the default in Settings). `refresh_if_moved` re-registers only if the registered exe path no longer exists. |
 | `icon_art.rs` | Procedural icon. It is used by the app for the window icon, and `include!`d by `build.rs` to write the `.ico` that `winresource` embeds. |
 
 `io.rs` details:
@@ -180,6 +202,11 @@ GUI smoke tests are driven from PowerShell:
 
 ## Release procedure
 
+Commit as `Sina <sina.mirshahi@fh-steyr.at>` (set repo-locally). That email is
+linked to the FH-Prevail GitHub account, so GitHub credits the commits to it.
+The first two commits used `p42872@fhooe.at`, which no GitHub account claims,
+so GitHub shows them without an author.
+
 1. Bump `version` in `Cargo.toml`, then run `cargo test` and
    `cargo build --release`.
 2. Package `DataVivid-<ver>-windows-x64.zip` containing `datavivid.exe`,
@@ -188,7 +215,13 @@ GUI smoke tests are driven from PowerShell:
 3. Write `SHA256SUMS.txt` for the exe and the zip.
 4. Tag `v<ver>` and create the GitHub release with the exe, zip and checksums
    as assets.
-5. Without the `gh` CLI, use the REST API:
+5. **Linux, from a Linux machine with podman or docker:** run
+   `scripts/release-linux.sh`. It writes `dist/datavivid-<ver>-linux-x64`
+   and `dist/DataVivid-<ver>-linux-x64.tar.gz` (the binary, `install.sh`,
+   `uninstall.sh`, README and LICENSE) and prints their SHA-256. Add both
+   files to the release and both hashes to `SHA256SUMS.txt`. A rerun only
+   recompiles DataVivid, because the cache is in `target/linux-portable`.
+6. Without the `gh` CLI, use the REST API:
    - Get a token from `git credential fill`. Never print or store it.
    - `POST /repos/FH-Prevail/DataVivid/releases`, then upload the assets to
      `uploads.github.com/.../releases/<id>/assets?name=…` with
@@ -197,8 +230,7 @@ GUI smoke tests are driven from PowerShell:
 ## Next steps (ideas, roughly by value)
 
 1. CI (GitHub Actions) building Windows, macOS and Linux artifacts; then
-   macOS `.app` (cargo-bundle, `CFBundleDocumentTypes`) and Linux `.desktop`
-   integration in code.
+   macOS `.app` (cargo-bundle, `CFBundleDocumentTypes`).
 2. Keep the cell editor open on invalid input instead of moving down.
 3. Lazy or streaming open for files larger than RAM (Polars `scan_*`), with
    the grid reading slices.

@@ -15,6 +15,7 @@ mod winassoc;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(windows)]
 const HELP: &str = "\
 DataVivid - view, clean and convert tabular data
 Originally developed by the Prevail Team, FH Steyr. MIT License.
@@ -29,6 +30,32 @@ Usage:
   datavivid --convert IN OUT    convert IN to OUT (format from the extension)
   datavivid --help | --version
 ";
+
+#[cfg(not(windows))]
+const HELP: &str = "\
+DataVivid - view, clean and convert tabular data
+Originally developed by the Prevail Team, FH Steyr. MIT License.
+
+Usage:
+  datavivid [FILE]              open FILE (CSV, TSV, Parquet, JSON, NDJSON,
+                                Arrow/Feather, Avro, Excel, ODS, SQLite)
+  datavivid --register          add DataVivid to the application menu and to
+                                the file manager's \"Open with\" (current user)
+  datavivid --make-default      register, then make DataVivid the default app
+                                for CSV, TSV, Parquet, JSON Lines, Arrow, Avro
+                                and SQLite (JSON, Excel and ODS are left alone)
+  datavivid --unregister        remove the registration and those defaults
+  datavivid --status            show the registration status
+  datavivid --convert IN OUT    convert IN to OUT (format from the extension)
+  datavivid --help | --version
+";
+
+#[cfg(windows)]
+const REGISTERED_MSG: &str = "DataVivid is registered. Pick it as the default in Settings > Apps > Default apps, \
+                              or via Open with > Choose another app > Always.";
+#[cfg(not(windows))]
+const REGISTERED_MSG: &str = "DataVivid is registered. It is in the application menu and under Open with; \
+                              run `datavivid --make-default` to open data files with it on double-click.";
 
 fn main() -> std::process::ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -45,11 +72,12 @@ fn main() -> std::process::ExitCode {
                 println!("DataVivid {}", env!("CARGO_PKG_VERSION"));
                 0
             }
-            "--register" => report(winassoc::register().map(|_| {
-                "DataVivid is registered. Pick it as the default in Settings > Apps > Default apps, \
-                 or via Open with > Choose another app > Always."
-                    .to_string()
-            })),
+            "--register" => report(winassoc::register().map(|_| REGISTERED_MSG.to_string())),
+            #[cfg(not(windows))]
+            "--make-default" => report(
+                winassoc::choose_defaults()
+                    .map(|_| "DataVivid is registered and is now the default app for data files.".to_string()),
+            ),
             "--unregister" => report(winassoc::unregister().map(|_| "DataVivid registration removed.".to_string())),
             "--status" => {
                 println!("{:?}", winassoc::status());

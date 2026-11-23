@@ -47,6 +47,7 @@ impl Format {
     }
 
     /// Short name used for ProgIDs, e.g. `DataVivid.Parquet`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn key(self) -> &'static str {
         match self {
             Format::Csv => "Csv",
