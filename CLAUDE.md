@@ -39,6 +39,21 @@ v0.1.2 adds a Windows installer; the program itself is unchanged since 0.1.1.
     the workflow tests it on windows-latest.
 - **Not the other way round:** running `install.ps1` after the setup would
   give two Settings > Apps entries. The docs recommend the setup.
+- **Published 2026-11-23:**
+  https://github.com/FH-Prevail/DataVivid/releases/tag/v0.1.2 (tag on
+  `8a81bd3`, run 45216920061, about 30 min with the warm main cache).
+  - Before tagging, a manual run on `main` (45208819283) passed all 17
+    installer checks.
+  - Anonymous downloads of all 5 files pass `sha256sum -c`.
+  - SHA-256:
+    - setup `906d888eaf5bc2837380696d1e0316ec6043d88a29f42e9bcca6adbe64212369`
+    - zip `55228e48424b439dccbb130d923d1bf052384338c7dc7ee2fb71784d087eff7d`
+    - exe `6f02b6d37aee1afd842fdec2c1024681c80b5921a675b00a836e2743faacda98`
+    - tarball `95dbbb1f47df39ff077efa7b376e956d06d41eb1b9be454e2fe476253848974c`
+    - Linux binary `2fff11168bee69056aba77a329fa07eaffb4b8bd8a122c8ea74b0f5c56c69c19`
+  - The Linux laptop runs 0.1.2 from the tarball.
+  - The setup's wizard UI has not been seen by a person yet; CI only ran it
+    silently.
 
 v0.1.1 was the first release built by GitHub Actions
 (`.github/workflows/release.yml`). Changes since v0.1.0:
