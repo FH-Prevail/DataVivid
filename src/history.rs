@@ -92,6 +92,15 @@ impl History {
         }
     }
 
+    /// The most recently applied operation.
+    pub fn last_op(&self) -> Option<&Op> {
+        self.cursor.checked_sub(1).map(|i| &self.steps[i].op)
+    }
+    /// The table before the most recently applied operation.
+    pub fn before_last(&self) -> &DataFrame {
+        if self.cursor <= 1 { &self.base } else { &self.steps[self.cursor - 2].df }
+    }
+
     pub fn steps(&self) -> &[Step] {
         &self.steps
     }

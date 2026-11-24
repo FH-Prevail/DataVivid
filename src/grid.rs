@@ -5,7 +5,7 @@
 //! rows (not pixels) because egui works in `f32`, which can't address pixel
 //! offsets of tables with millions of rows exactly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use egui::{
     Align2, Color32, CursorIcon, Event, EventFilter, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind,
@@ -49,6 +49,8 @@ pub enum ColumnCommand {
     SortDesc,
     Filter,
     FilterValue(Option<String>),
+    /// Opens the filter-by-values list at this screen position.
+    ValueFilter(Pos2),
     Rename,
     ChangeType,
     FillMissing,
@@ -79,6 +81,7 @@ pub struct GridState {
     pub whole_rows: bool,
     pub editing: Option<Editing>,
     context: Option<ContextTarget>,
+    context_pos: Pos2,
     resizing: Option<(usize, f32, f32)>,
     drag_vbar: Option<f32>,
     drag_hbar: Option<f32>,
@@ -261,11 +264,23 @@ impl Layout {
     fn htrack(&self) -> Rect {
         Rect::from_min_max(pos2(self.data.min.x, self.full.max.y - SCROLLBAR), pos2(self.data.max.x, self.full.max.y))
     }
+    /// The filter button in the top right corner of a column header, if the
+    /// column is wide enough for one.
+    fn filter_button(&self, ci: usize, scroll_x: f32) -> Option<Rect> {
+        if self.widths[ci] < 64.0 {
+            return None;
+        }
+        let right = self.col_left(ci, scroll_x) + self.widths[ci];
+        Some(Rect::from_min_size(pos2(right - FILTER_BTN - 4.0, self.full.min.y + 4.0), Vec2::splat(FILTER_BTN)))
+    }
 }
+
+const FILTER_BTN: f32 = 18.0;
 
 #[derive(Clone, Copy, Debug)]
 enum Hit {
     Header { col: usize, edge: Option<usize> },
+    FilterButton(usize),
     RowNum(usize),
     Cell(Cell),
     VBar,
@@ -289,6 +304,9 @@ fn hit(l: &Layout, st: &GridState, p: Pos2, nrows: usize) -> Hit {
             }
         }
         return match l.col_at(p.x, st.scroll_x) {
+            Some(c) if p.x >= l.data.min.x && l.filter_button(c, st.scroll_x).is_some_and(|b| b.contains(p)) => {
+                Hit::FilterButton(c)
+            }
             Some(c) if p.x >= l.data.min.x => Hit::Header { col: c, edge: None },
             _ => Hit::Empty,
         };
@@ -303,7 +321,15 @@ fn hit(l: &Layout, st: &GridState, p: Pos2, nrows: usize) -> Hit {
     }
 }
 
-pub fn show(ui: &mut Ui, df: &DataFrame, profiles: &HashMap<String, ColumnProfile>, st: &mut GridState) -> Vec<GridAction> {
+/// Draws the grid and handles its input. Columns named in `filtered` get a
+/// highlighted filter button.
+pub fn show(
+    ui: &mut Ui,
+    df: &DataFrame,
+    profiles: &HashMap<String, ColumnProfile>,
+    filtered: &HashSet<String>,
+    st: &mut GridState,
+) -> Vec<GridAction> {
     let mut actions = Vec::new();
     let nrows = df.height();
     let ncols = df.width();
@@ -377,9 +403,18 @@ pub fn show(ui: &mut Ui, df: &DataFrame, profiles: &HashMap<String, ColumnProfil
             if let Hit::Header { edge: Some(_), .. } = h {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
+            if let (Hit::FilterButton(_), true) = (h, resp.hovered()) {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                resp.clone().on_hover_text_at_pointer("Filter by values (Alt+Down)");
+            }
         }
         if pressed && in_full && resp.hovered() {
             match h {
+                Hit::FilterButton(col) => {
+                    commit_edit(st, df, &mut actions);
+                    let b = l.filter_button(col, st.scroll_x).unwrap_or(Rect::from_min_size(p, Vec2::ZERO));
+                    actions.push(GridAction::Column(col, ColumnCommand::ValueFilter(b.left_bottom())));
+                }
                 Hit::Header { edge: Some(ci), .. } => st.resizing = Some((ci, l.widths[ci], p.x)),
                 Hit::Header { col, edge: None } => {
                     if mods.shift && st.whole_cols {
@@ -490,8 +525,9 @@ pub fn show(ui: &mut Ui, df: &DataFrame, profiles: &HashMap<String, ColumnProfil
     // Right click: remember the target and make sure it is selected.
     if resp.secondary_clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
+            st.context_pos = p;
             let target = match hit(&l, st, p, nrows) {
-                Hit::Header { col, .. } => {
+                Hit::Header { col, .. } | Hit::FilterButton(col) => {
                     if !(st.whole_cols && st.selection(nrows, ncols).is_some_and(|(_, _, c0, c1)| (c0..=c1).contains(&col))) {
                         st.select_column(col);
                     }
@@ -553,7 +589,7 @@ pub fn show(ui: &mut Ui, df: &DataFrame, profiles: &HashMap<String, ColumnProfil
     st.top_row = st.top_row.clamp(0.0, max_top);
     st.scroll_x = st.scroll_x.clamp(0.0, max_sx);
 
-    paint(ui, df, profiles, st, &l);
+    paint(ui, df, profiles, filtered, st, &l);
 
     // ---- inline editor ----------------------------------------------------
     if st.editing.is_some() {
@@ -593,7 +629,14 @@ fn hthumb(l: &Layout, st: &GridState) -> Rect {
     Rect::from_min_size(pos2(x, track.min.y + 2.0), vec2(w, SCROLLBAR - 4.0))
 }
 
-fn paint(ui: &Ui, df: &DataFrame, profiles: &HashMap<String, ColumnProfile>, st: &GridState, l: &Layout) {
+fn paint(
+    ui: &Ui,
+    df: &DataFrame,
+    profiles: &HashMap<String, ColumnProfile>,
+    filtered: &HashSet<String>,
+    st: &GridState,
+    l: &Layout,
+) {
     let v = ui.visuals();
     let painter = ui.painter_at(l.full);
     let nrows = df.height();
@@ -699,13 +742,43 @@ fn paint(ui: &Ui, df: &DataFrame, profiles: &HashMap<String, ColumnProfile>, st:
         }
         let inner = hp.with_clip_rect(rect.shrink2(vec2(5.0, 0.0)));
         let col = &columns[c];
-        inner.text(
+        let button = l.filter_button(c, st.scroll_x);
+        let name_clip = match button {
+            Some(b) => Rect::from_min_max(rect.min + vec2(5.0, 0.0), pos2(b.min.x - 2.0, rect.max.y)),
+            None => rect.shrink2(vec2(5.0, 0.0)),
+        };
+        hp.with_clip_rect(name_clip.intersect(header)).text(
             pos2(rect.min.x + 6.0, rect.min.y + 5.0),
             Align2::LEFT_TOP,
             col.name().as_str(),
             FontId::proportional(13.5),
             v.strong_text_color(),
         );
+        if let Some(b) = button {
+            let active = filtered.contains(col.name().as_str());
+            let hovered = ui.rect_contains_pointer(b);
+            if hovered || active {
+                let fill = if hovered { v.widgets.hovered.weak_bg_fill } else { v.widgets.inactive.weak_bg_fill };
+                hp.rect_filled(b, 3.0, fill);
+            }
+            hp.rect_stroke(b, 3.0, Stroke::new(1.0, grid_line), StrokeKind::Inside);
+            let cx = b.center();
+            if active {
+                // A funnel.
+                let pts = vec![
+                    cx + vec2(-5.0, -4.5),
+                    cx + vec2(5.0, -4.5),
+                    cx + vec2(1.2, 0.5),
+                    cx + vec2(1.2, 5.0),
+                    cx + vec2(-1.2, 3.5),
+                    cx + vec2(-1.2, 0.5),
+                ];
+                hp.add(egui::Shape::convex_polygon(pts, accent, Stroke::NONE));
+            } else {
+                let pts = vec![cx + vec2(-4.0, -2.0), cx + vec2(4.0, -2.0), cx + vec2(0.0, 2.5)];
+                hp.add(egui::Shape::convex_polygon(pts, if hovered { text_color } else { weak }, Stroke::NONE));
+            }
+        }
         let profile = profiles.get(col.name().as_str());
         let dtype = crate::stats::dtype_label(col.dtype());
         let mut info = dtype;
@@ -913,6 +986,15 @@ fn keyboard(ui: &mut Ui, df: &DataFrame, st: &mut GridState, l: &Layout, actions
                 let ctrl = modifiers.command;
                 match key {
                     Key::ArrowUp => move_cursor(st, nrows, ncols, if ctrl { -(nrows as i64) } else { -1 }, 0, ext),
+                    Key::ArrowDown if modifiers.alt => {
+                        if let Some(c) = st.cursor.filter(|c| c.col < ncols) {
+                            let at = l.filter_button(c.col, st.scroll_x).map_or(
+                                pos2(l.col_left(c.col, st.scroll_x).max(l.data.min.x), l.data.min.y),
+                                |b| b.left_bottom(),
+                            );
+                            actions.push(GridAction::Column(c.col, ColumnCommand::ValueFilter(at)));
+                        }
+                    }
                     Key::ArrowDown => move_cursor(st, nrows, ncols, if ctrl { nrows as i64 } else { 1 }, 0, ext),
                     Key::ArrowLeft => move_cursor(st, nrows, ncols, 0, if ctrl { -(ncols as i64) } else { -1 }, ext),
                     Key::ArrowRight => move_cursor(st, nrows, ncols, 0, if ctrl { ncols as i64 } else { 1 }, ext),
@@ -986,19 +1068,22 @@ fn copy_selection(ui: &Ui, st: &GridState, df: &DataFrame, actions: &mut Vec<Gri
                 out.push('\t');
             }
             if let Some(t) = columns[c].get(r).ok().and_then(|v| value_text(&v)) {
-                if t.contains(['\t', '\n', '"']) {
-                    out.push('"');
-                    out.push_str(&t.replace('"', "\"\""));
-                    out.push('"');
-                } else {
-                    out.push_str(&t);
-                }
+                out.push_str(&tsv_field(&t));
             }
         }
         out.push('\n');
     }
     ui.ctx().copy_text(out);
     actions.push(GridAction::Status(format!("Copied {cells} cell(s)")));
+}
+
+/// Quotes a value for tab-separated clipboard text the way Excel does.
+pub fn tsv_field(t: &str) -> std::borrow::Cow<'_, str> {
+    if t.contains(['\t', '\n', '\r', '"']) {
+        format!("\"{}\"", t.replace('"', "\"\"")).into()
+    } else {
+        t.into()
+    }
 }
 
 fn clear_selection(st: &GridState, df: &DataFrame, actions: &mut Vec<GridAction>) {
@@ -1140,6 +1225,7 @@ fn context_menu(ui: &mut Ui, df: &DataFrame, st: &mut GridState, actions: &mut V
         ui.close();
         return;
     };
+    let at = st.context_pos;
     let col_cmds = |ui: &mut Ui, c: usize, actions: &mut Vec<GridAction>| {
         let mut cmd = |ui: &mut Ui, label: &str, cc: ColumnCommand| {
             if ui.button(label).clicked() {
@@ -1149,7 +1235,8 @@ fn context_menu(ui: &mut Ui, df: &DataFrame, st: &mut GridState, actions: &mut V
         };
         cmd(ui, "Sort ascending", ColumnCommand::SortAsc);
         cmd(ui, "Sort descending", ColumnCommand::SortDesc);
-        cmd(ui, "Filter…", ColumnCommand::Filter);
+        cmd(ui, "Filter by values…", ColumnCommand::ValueFilter(at));
+        cmd(ui, "Filter by condition…", ColumnCommand::Filter);
         ui.separator();
         cmd(ui, "Rename…", ColumnCommand::Rename);
         cmd(ui, "Change type…", ColumnCommand::ChangeType);

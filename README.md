@@ -156,11 +156,19 @@ SQLite databases are never overwritten in place (*Save* becomes *Save as*).
   previous, next), drop missing, drop duplicates, rename, move, insert or
   delete columns, add a column from a SQL formula, trim/case, round, and a full
   **SQL query** against the table (`SELECT … FROM data`).
+- **Filter by values, like Excel**: the small button in each column header
+  (or Alt+Down, or *Filter by values…* in the header menu) lists every
+  distinct value with its row count. Search, tick and untick, OK. A filtered
+  column shows a funnel. Reopening the filter right after applying it edits
+  that filter instead of adding another one, and *Clear filter* removes it.
 - **Preview** any operation before applying it.
 - **Steps & undo**: every change is a step; undo/redo (Ctrl+Z/Ctrl+Y) or click
   a step to go back to it.
 - **Summary panel**: per-column statistics (missing, distinct, quantiles, mean,
-  std, histogram, most frequent values) computed in the background.
+  std, histogram, most frequent values) computed in the background. *Copy*
+  puts all of it on the clipboard as a table that pastes into Excel;
+  right-click any value, a frequent value or the histogram to copy just that
+  (or to keep only the rows with a frequent value).
 - **Safe saving**: writes to a temporary file first and then replaces the
   original, so a failed save never destroys your data. Unsaved changes are
   never discarded without asking.

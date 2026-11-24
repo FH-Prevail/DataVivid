@@ -14,7 +14,48 @@ User-facing documentation is in `README.md`.
   "Open with" or default app. Linux is supported since 2026-11-23 (same
   single binary, XDG registration); macOS is planned (see README).
 
-## Status (v0.1.2, 2026-11-23)
+## Status (v0.1.3, 2026-11-24)
+
+v0.1.3 (asked for by a colleague of Sina's) adds:
+
+- **Filter by values (Excel-style):**
+  - Each header has a filter button (`Layout::filter_button`, hidden on
+    columns narrower than 64 px). Alt+Down and the header menu open it too.
+  - The button sends `ColumnCommand::ValueFilter(pos)`. The app shows the
+    list as an `egui::Area` popup (`App::value_filter_popup`), built from
+    `stats::distinct_values`: group_by, sorted in the column's own type,
+    then cast to String.
+  - OK applies `Op::FilterValues { values, exclude }`. It matches on
+    `cast(String)`, the same text as the list, and stores whichever side
+    (kept or removed) is shorter.
+  - If the newest step is a FilterValues on the same column, the list is
+    built from `History::before_last()`, and OK undoes that step before
+    applying, so it edits the filter instead of stacking another.
+  - With a search active, OK keeps only the ticked values that match (as
+    Excel does). Clicking outside or Escape cancels.
+  - Columns with a Filter or FilterValues among the applied steps get a
+    funnel icon (`App::filtered_columns`).
+- **Copy from the summary panel:**
+  - `StatRow` holds the shown text plus the copy cells, which have no
+    thousands separators.
+  - `profile_text` and `dataset_text` build tab-separated tables.
+  - There is a Copy button, and right-click menus on stat rows, frequent
+    values (with "Keep only rows with this value" for text, category and
+    bool columns) and the histogram.
+- **Fix:** `shortcuts()` used `egui_wants_keyboard_input()`, which is true
+  whenever any widget has focus, including the grid. So Ctrl+Z, Ctrl+Y and
+  Ctrl+F never fired after clicking a cell. It now uses
+  `text_edit_focused()`.
+- **Linux font fallback:** `install_fonts` adds DejaVu Sans or Noto Sans
+  after egui's font for symbols it lacks (→, ●, ↑). Before, they showed as
+  boxes.
+- **Testing:** 21 unit tests pass. The GUI was tested on Linux (X11) with
+  the 1M-row CSV: filter, reopen and replace, search + Enter, numeric order,
+  a 134k-value list, Escape and click-outside, all copy entries (checked
+  with xclip), keep-only, Ctrl+Z/Ctrl+Y, and Ctrl+Z inside the cell
+  editor.
+
+### v0.1.2 (2026-11-23)
 
 v0.1.2 adds a Windows installer; the program itself is unchanged since 0.1.1.
 

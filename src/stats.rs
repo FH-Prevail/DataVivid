@@ -172,6 +172,25 @@ fn top_values(df: &DataFrame, column: &str, k: usize) -> Result<Vec<(String, u64
         .collect())
 }
 
+/// Every distinct value of a column with its count, for the filter-by-values
+/// list: in the column's own sort order (numbers by size, dates by time),
+/// missing last. The text is what `Op::FilterValues` compares against.
+pub fn distinct_values(df: &DataFrame, column: &str) -> Result<Vec<(Option<String>, u64)>> {
+    const N: &str = "__datavivid_count__";
+    let out = df
+        .clone()
+        .lazy()
+        .select([col(column)])
+        .group_by([col(column)])
+        .agg([len().alias(N)])
+        .sort([column], SortMultipleOptions::default().with_nulls_last(true))
+        .select([col(column).cast(DataType::String), col(N).cast(DataType::UInt64)])
+        .collect()?;
+    let vals = out.column(column)?.str()?;
+    let counts = out.column(N)?.u64()?;
+    Ok(vals.iter().zip(counts.iter()).map(|(v, n)| (v.map(String::from), n.unwrap_or(0))).collect())
+}
+
 pub fn dtype_label(d: &DataType) -> String {
     match d {
         DataType::String => "text".into(),

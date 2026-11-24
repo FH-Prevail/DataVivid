@@ -1,6 +1,6 @@
 //! The DataVivid window: menus, side panels, dialogs and background jobs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -240,6 +240,35 @@ impl Default for OpForm {
     }
 }
 
+/// The Excel-style "filter by values" list of one column.
+struct ValueFilter {
+    column: String,
+    /// Distinct values (as text, `None` = missing) with their row counts.
+    items: Vec<(Option<String>, u64)>,
+    checked: Vec<bool>,
+    search: String,
+    /// Indices into `items` that match `search`, and the search they are for.
+    shown: Vec<usize>,
+    shown_for: Option<String>,
+    /// The column's value filter is the last step, so OK replaces that step
+    /// (and the list shows the values from before it), like reopening a
+    /// filter in Excel.
+    replaces: bool,
+    pos: egui::Pos2,
+    /// History version the list was built for; any change closes it.
+    version: u64,
+    first_frame: bool,
+    numeric: bool,
+}
+
+enum ValueFilterAction {
+    Ok,
+    Cancel,
+    Clear,
+    Sort(bool),
+    Condition,
+}
+
 enum Job {
     Load { rx: Receiver<Result<Loaded>>, path: PathBuf, started: Instant },
     Save { rx: Receiver<Result<()>>, path: PathBuf, opts: SaveOptions, version: u64 },
@@ -257,6 +286,7 @@ pub struct App {
     job: Option<Job>,
     preview: Option<Preview>,
     dialog: Option<Dialog>,
+    value_filter: Option<ValueFilter>,
     status: Option<(String, bool, Instant)>,
     title: String,
     reg_status: winassoc::Status,
@@ -289,6 +319,7 @@ impl App {
             job: None,
             preview: None,
             dialog: None,
+            value_filter: None,
             status: None,
             title: String::new(),
             reg_status: winassoc::status(),
@@ -610,6 +641,7 @@ impl App {
                 };
                 self.apply(op);
             }
+            ColumnCommand::ValueFilter(pos) => self.open_value_filter(name, pos),
             ColumnCommand::Rename => {
                 self.form.new_name = name;
                 open(self, OpKind::Rename);
@@ -642,6 +674,251 @@ impl App {
             }
             ColumnCommand::MoveLeft | ColumnCommand::MoveRight => {}
         }
+    }
+
+    // ---- filter by values -------------------------------------------------
+
+    fn open_value_filter(&mut self, column: String, pos: egui::Pos2) {
+        let Some(doc) = &self.doc else { return };
+        let last = match doc.history.last_op() {
+            Some(op @ Op::FilterValues { column: c, .. }) if *c == column => Some(op.clone()),
+            _ => None,
+        };
+        let df = if last.is_some() { doc.history.before_last() } else { doc.df() };
+        let numeric = df.column(&column).is_ok_and(|c| c.dtype().is_primitive_numeric());
+        let items = match stats::distinct_values(df, &column) {
+            Ok(items) => items,
+            Err(e) => {
+                self.error(format!("Can't list the values of {column}: {e:#}"));
+                return;
+            }
+        };
+        let checked = match &last {
+            Some(Op::FilterValues { values, exclude, .. }) => {
+                let set: HashSet<&Option<String>> = values.iter().collect();
+                items.iter().map(|(v, _)| set.contains(v) != *exclude).collect()
+            }
+            _ => vec![true; items.len()],
+        };
+        self.value_filter = Some(ValueFilter {
+            column,
+            items,
+            checked,
+            search: String::new(),
+            shown: Vec::new(),
+            shown_for: None,
+            replaces: last.is_some(),
+            pos,
+            version: doc.history.version(),
+            first_frame: true,
+            numeric,
+        });
+    }
+
+    fn value_filter_popup(&mut self, ctx: &egui::Context) {
+        let Some(vf) = &mut self.value_filter else { return };
+        let current = self.doc.as_ref().map(|d| d.history.version());
+        if current != Some(vf.version) || self.preview.is_some() {
+            self.value_filter = None;
+            return;
+        }
+        if vf.shown_for.as_deref() != Some(vf.search.as_str()) {
+            let needle = vf.search.trim().to_lowercase();
+            vf.shown = (0..vf.items.len())
+                .filter(|&i| needle.is_empty() || value_label(&vf.items[i].0).to_lowercase().contains(&needle))
+                .collect();
+            vf.shown_for = Some(vf.search.clone());
+        }
+        let searching = !vf.search.trim().is_empty();
+        let first = std::mem::replace(&mut vf.first_frame, false);
+        let mut action = None;
+        let area = egui::Area::new(Id::unique("value-filter"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(vf.pos)
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(300.0);
+                    ui.label(RichText::new(format!("Filter {}", vf.column)).strong());
+                    let (asc, desc) = if vf.numeric {
+                        ("Sort smallest to largest", "Sort largest to smallest")
+                    } else {
+                        ("Sort A to Z", "Sort Z to A")
+                    };
+                    if ui.add(egui::Button::new(asc).frame(false)).clicked() {
+                        action = Some(ValueFilterAction::Sort(false));
+                    }
+                    if ui.add(egui::Button::new(desc).frame(false)).clicked() {
+                        action = Some(ValueFilterAction::Sort(true));
+                    }
+                    if vf.replaces
+                        && ui.add(egui::Button::new(format!("Clear filter from {}", vf.column)).frame(false)).clicked()
+                    {
+                        action = Some(ValueFilterAction::Clear);
+                    }
+                    if ui.add(egui::Button::new("Filter by condition…").frame(false)).clicked() {
+                        action = Some(ValueFilterAction::Condition);
+                    }
+                    ui.separator();
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut vf.search).hint_text("Search").desired_width(f32::INFINITY),
+                    );
+                    if first {
+                        search.request_focus();
+                    }
+                    let on = vf.shown.iter().filter(|&&i| vf.checked[i]).count();
+                    let mut all = on == vf.shown.len() && on > 0;
+                    let label = if searching { "(Select all search results)" } else { "(Select all)" };
+                    let indeterminate = on > 0 && on < vf.shown.len();
+                    if ui.add(egui::Checkbox::new(&mut all, label).indeterminate(indeterminate)).changed() {
+                        for &i in &vf.shown {
+                            vf.checked[i] = all;
+                        }
+                    }
+                    let row_h = ui.spacing().interact_size.y;
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, true]).show_rows(
+                            ui,
+                            row_h,
+                            vf.shown.len(),
+                            |ui, range| {
+                                for &i in &vf.shown[range] {
+                                    ui.horizontal(|ui| {
+                                        ui.set_height(row_h);
+                                        ui.add(egui::Checkbox::without_text(&mut vf.checked[i]));
+                                        let (v, n) = &vf.items[i];
+                                        let text = match v {
+                                            Some(s) if !s.is_empty() => RichText::new(s.replace(['\n', '\r'], " ")),
+                                            _ => RichText::new(value_label(v)).italics().weak(),
+                                        };
+                                        let w = (ui.available_width() - 70.0).max(40.0);
+                                        let clicked = ui
+                                            .allocate_ui_with_layout(
+                                                egui::vec2(w, row_h),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.set_max_width(w);
+                                                    ui.add(egui::Label::new(text).truncate().sense(egui::Sense::click()))
+                                                        .clicked()
+                                                },
+                                            )
+                                            .inner;
+                                        if clicked {
+                                            vf.checked[i] = !vf.checked[i];
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.add_space(10.0); // clear of the scroll bar
+                                            ui.label(RichText::new(fmt_int(*n as usize)).weak().size(11.5));
+                                        });
+                                    });
+                                }
+                            },
+                        );
+                    });
+                    if vf.shown.is_empty() {
+                        ui.label(RichText::new("No matching values").weak());
+                    }
+                    ui.separator();
+                    let considered: Vec<usize> =
+                        if searching { vf.shown.clone() } else { (0..vf.items.len()).collect() };
+                    let keep = considered.iter().filter(|&&i| vf.checked[i]).count();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} of {} values", fmt_int(keep), fmt_int(vf.items.len())))
+                                .weak()
+                                .size(12.0),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Cancel").clicked() {
+                                action = Some(ValueFilterAction::Cancel);
+                            }
+                            if ui.add_enabled(keep > 0, egui::Button::new(RichText::new("  OK  ").strong())).clicked() {
+                                action = Some(ValueFilterAction::Ok);
+                            }
+                        });
+                    });
+                    if searching {
+                        ui.label(RichText::new("OK keeps only the ticked values that match the search.").weak().size(11.5));
+                    }
+                    if keep > 0 && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        action = Some(ValueFilterAction::Ok);
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            action = Some(ValueFilterAction::Cancel);
+        }
+        // A click outside closes the list without filtering, as in Excel.
+        if !first && action.is_none() {
+            let outside = ctx.input(|i| {
+                i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !area.response.rect.contains(p))
+            });
+            if outside {
+                action = Some(ValueFilterAction::Cancel);
+            }
+        }
+        let Some(action) = action else { return };
+        let Some(vf) = self.value_filter.take() else { return };
+        match action {
+            ValueFilterAction::Cancel => {}
+            ValueFilterAction::Ok => self.apply_value_filter(vf),
+            ValueFilterAction::Clear => {
+                if let Some(doc) = &mut self.doc {
+                    doc.history.undo();
+                }
+                self.info(format!("Cleared the filter on {}", vf.column));
+            }
+            ValueFilterAction::Sort(desc) => self.apply(Op::Sort { columns: vec![(vf.column, desc)] }),
+            ValueFilterAction::Condition => {
+                self.form.column = vf.column;
+                self.form.kind = OpKind::Filter;
+                self.settings.show_ops = true;
+            }
+        }
+    }
+
+    fn apply_value_filter(&mut self, vf: ValueFilter) {
+        let searching = !vf.search.trim().is_empty();
+        let n = vf.items.len();
+        let keep: Vec<bool> = if searching {
+            let shown: HashSet<usize> = vf.shown.iter().copied().collect();
+            (0..n).map(|i| vf.checked[i] && shown.contains(&i)).collect()
+        } else {
+            vf.checked.clone()
+        };
+        let kept = keep.iter().filter(|k| **k).count();
+        if kept == 0 {
+            return;
+        }
+        if vf.replaces {
+            if let Some(doc) = &mut self.doc {
+                doc.history.undo();
+            }
+        }
+        if kept == n {
+            if vf.replaces {
+                self.info(format!("Cleared the filter on {}", vf.column));
+            }
+            return;
+        }
+        // Store whichever list is shorter.
+        let exclude = kept * 2 > n;
+        let values =
+            vf.items.into_iter().zip(keep).filter(|(_, k)| *k != exclude).map(|((v, _), _)| v).collect();
+        self.apply(Op::FilterValues { column: vf.column, values, exclude });
+    }
+
+    /// Columns with a filter among the applied steps (for the header buttons).
+    fn filtered_columns(&self) -> HashSet<String> {
+        let Some(doc) = &self.doc else { return HashSet::new() };
+        doc.history.steps()[..doc.history.cursor()]
+            .iter()
+            .filter_map(|s| match &s.op {
+                Op::Filter { column, .. } | Op::FilterValues { column, .. } => Some(column.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn build_op(&self, df: &DataFrame) -> Result<Op> {
@@ -794,7 +1071,9 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let sc = |m: Modifiers, k: Key| KeyboardShortcut::new(m, k);
-        let typing = ctx.egui_wants_keyboard_input();
+        // Only a text field keeps Ctrl+Z etc. for itself; the grid has
+        // keyboard focus most of the time and must not block undo.
+        let typing = ctx.text_edit_focused();
         if ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::O))) {
             self.open_dialog(ctx);
         }
@@ -876,6 +1155,7 @@ impl eframe::App for App {
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0.0))
             .show(ui, |ui| self.central(ui, &ctx));
 
+        self.value_filter_popup(&ctx);
         self.dialogs(&ctx);
 
         if self.job.is_some() {
@@ -1251,10 +1531,11 @@ impl App {
             }
         }
 
+        let filtered = self.filtered_columns();
         let actions = {
             let doc = self.doc.as_ref().unwrap();
             let df = self.preview.as_ref().map_or(doc.df(), |p| &p.df);
-            grid::show(ui, df, &self.profiles, &mut self.grid)
+            grid::show(ui, df, &self.profiles, &filtered, &mut self.grid)
         };
         for a in actions {
             match a {
@@ -1684,14 +1965,31 @@ impl App {
     fn summary_panel(&mut self, ui: &mut Ui) {
         let Some(doc) = &self.doc else { return };
         let df = doc.df();
+        let mut action = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             let col = self.grid.cursor.and_then(|c| df.get_column_names().get(c.col).map(|s| s.to_string()));
             match col {
                 Some(name) => {
-                    ui.heading(&name);
-                    match self.profiles.get(&name) {
-                        Some(p) => profile_ui(ui, p),
+                    let profile = self.profiles.get(&name);
+                    ui.horizontal(|ui| {
+                        if let Some(p) = profile {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if copy_button(ui) {
+                                    action = Some(PanelAction::Copy(profile_text(p), "column statistics".into()));
+                                }
+                                ui.add(egui::Label::new(RichText::new(&name).heading()).truncate());
+                            });
+                        } else {
+                            ui.heading(&name);
+                        }
+                    });
+                    match profile {
+                        Some(p) => {
+                            if let Some(a) = profile_ui(ui, p) {
+                                action = Some(a);
+                            }
+                        }
                         None => {
                             ui.horizontal(|ui| {
                                 ui.spinner();
@@ -1700,45 +1998,55 @@ impl App {
                         }
                     }
                     ui.add_space(10.0);
-                    ui.label(RichText::new("Right-click the column header for column actions.").weak().size(12.0));
+                    ui.label(
+                        RichText::new("Right-click a value to copy it, or the column header for column actions.")
+                            .weak()
+                            .size(12.0),
+                    );
                 }
                 None => {
-                    ui.heading("Dataset");
-                    let missing: usize = df.columns().iter().map(|c| c.null_count()).sum();
-                    let cells = (df.height() * df.width()).max(1);
+                    let rows = dataset_rows(df, &doc.path);
+                    let all = dataset_text(df, &rows);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if copy_button(ui) {
+                                action = Some(PanelAction::Copy(all.clone(), "dataset summary".into()));
+                            }
+                            ui.heading("Dataset");
+                        });
+                    });
                     egui::Grid::new("ds").num_columns(2).striped(true).show(ui, |ui| {
-                        ui.label("Rows");
-                        ui.label(fmt_int(df.height()));
-                        ui.end_row();
-                        ui.label("Columns");
-                        ui.label(df.width().to_string());
-                        ui.end_row();
-                        ui.label("Missing cells");
-                        ui.label(format!("{} ({:.1}%)", fmt_int(missing), missing as f64 * 100.0 / cells as f64));
-                        ui.end_row();
-                        ui.label("Memory");
-                        ui.label(fmt_bytes(df.estimated_size()));
-                        ui.end_row();
-                        if let Ok(meta) = std::fs::metadata(&doc.path) {
-                            ui.label("File size");
-                            ui.label(fmt_bytes(meta.len() as usize));
-                            ui.end_row();
+                        for r in &rows {
+                            if let Some(a) = stat_row(ui, r, &all, "dataset summary") {
+                                action = Some(a);
+                            }
                         }
                     });
                     ui.add_space(10.0);
                     ui.label(RichText::new("Columns").strong());
                     egui::Grid::new("cols").num_columns(3).striped(true).show(ui, |ui| {
                         for (i, c) in df.columns().iter().enumerate() {
-                            if ui.link(c.name().as_str()).clicked() {
+                            let r = ui.link(c.name().as_str());
+                            if r.clicked() {
                                 self.grid.select_column(i);
                             }
-                            ui.label(RichText::new(stats::dtype_label(c.dtype())).weak());
+                            let dtype = stats::dtype_label(c.dtype());
                             let m = c.null_count();
-                            if m > 0 {
-                                ui.label(RichText::new(format!("{:.1}% missing", m as f64 * 100.0 / df.height().max(1) as f64)).weak());
-                            } else {
-                                ui.label("");
-                            }
+                            let pct = format!("{:.1}% missing", m as f64 * 100.0 / df.height().max(1) as f64);
+                            r.context_menu(|ui| {
+                                if ui.button("Copy name").clicked() {
+                                    action = Some(PanelAction::Copy(c.name().to_string(), "column name".into()));
+                                }
+                                if ui.button("Copy all column names").clicked() {
+                                    let names: Vec<&str> = df.get_column_names().iter().map(|s| s.as_str()).collect();
+                                    action = Some(PanelAction::Copy(names.join("\n"), "column names".into()));
+                                }
+                                if ui.button("Copy dataset summary").clicked() {
+                                    action = Some(PanelAction::Copy(all.clone(), "dataset summary".into()));
+                                }
+                            });
+                            ui.label(RichText::new(dtype).weak());
+                            ui.label(if m > 0 { RichText::new(pct).weak() } else { RichText::new("") });
                             ui.end_row();
                         }
                     });
@@ -1747,6 +2055,20 @@ impl App {
                 }
             }
         });
+        match action {
+            Some(PanelAction::Copy(text, what)) => {
+                ui.ctx().copy_text(text);
+                self.info(format!("Copied {what}"));
+            }
+            Some(PanelAction::Keep(column, value)) => {
+                if self.preview.is_some() {
+                    self.error("Apply or discard the preview first");
+                } else {
+                    self.apply(Op::FilterValues { column, values: vec![Some(value)], exclude: false });
+                }
+            }
+            None => {}
+        }
     }
 
     // ---- dialogs ----------------------------------------------------------
@@ -2004,44 +2326,222 @@ impl App {
     }
 }
 
-fn profile_ui(ui: &mut Ui, p: &ColumnProfile) {
-    egui::Grid::new("profile").num_columns(2).striped(true).show(ui, |ui| {
-        let row = |ui: &mut Ui, k: &str, v: String| {
-            ui.label(k);
-            ui.label(v);
-            ui.end_row();
-        };
-        row(ui, "Type", p.dtype.clone());
-        row(ui, "Rows", fmt_int(p.rows));
-        row(ui, "Missing", format!("{} ({:.1}%)", fmt_int(p.missing), p.missing_pct()));
-        row(ui, "Distinct", fmt_int(p.unique));
-        if let Some(n) = &p.numeric {
-            row(ui, "Min", fmt_num(n.min));
-            row(ui, "25%", fmt_num(n.q25));
-            row(ui, "Median", fmt_num(n.median));
-            row(ui, "Mean", fmt_num(n.mean));
-            row(ui, "75%", fmt_num(n.q75));
-            row(ui, "Max", fmt_num(n.max));
-            row(ui, "Std. dev.", fmt_num(n.std));
-            row(ui, "Zeros", fmt_int(n.zeros));
-            row(ui, "Negative", fmt_int(n.negatives));
-            if n.nan > 0 {
-                row(ui, "NaN", fmt_int(n.nan));
+// ---------------------------------------------------------------------------
+// Summary panel pieces
+// ---------------------------------------------------------------------------
+
+enum PanelAction {
+    /// Text for the clipboard and what it is, for the status bar.
+    Copy(String, String),
+    /// Keep only the rows where a column has this value.
+    Keep(String, String),
+}
+
+/// One line of the statistics table: what is shown and what is copied
+/// (numbers without thousands separators, so spreadsheets read them).
+struct StatRow {
+    label: String,
+    shown: String,
+    /// One or more cells (e.g. count and percent).
+    cells: Vec<String>,
+}
+
+impl StatRow {
+    fn new(label: &str, shown: String, cells: &[&str]) -> Self {
+        StatRow { label: label.into(), shown, cells: cells.iter().map(|c| c.to_string()).collect() }
+    }
+    fn same(label: &str, text: String) -> Self {
+        StatRow { label: label.into(), cells: vec![text.clone()], shown: text }
+    }
+    /// The cells as clipboard text: a single value as is, several as
+    /// tab-separated cells.
+    fn value(&self) -> String {
+        match self.cells.as_slice() {
+            [one] => one.clone(),
+            cells => tsv_row(cells),
+        }
+    }
+    /// Label and cells as one tab-separated line.
+    fn line(&self) -> String {
+        let mut cells = vec![self.label.clone()];
+        cells.extend(self.cells.iter().cloned());
+        tsv_row(&cells)
+    }
+}
+
+fn tsv_row(cells: &[String]) -> String {
+    cells.iter().map(|c| grid::tsv_field(c)).collect::<Vec<_>>().join("\t")
+}
+
+/// Label for a distinct value in lists.
+fn value_label(v: &Option<String>) -> String {
+    match v {
+        None => "(missing)".into(),
+        Some(s) if s.is_empty() => "(empty)".into(),
+        Some(s) => s.clone(),
+    }
+}
+
+fn copy_button(ui: &mut Ui) -> bool {
+    ui.small_button("Copy")
+        .on_hover_text("Copy everything shown here as a table (pastes into Excel). Right-click a value to copy just that.")
+        .clicked()
+}
+
+fn stat_row(ui: &mut Ui, r: &StatRow, all: &str, what: &str) -> Option<PanelAction> {
+    let mut action = None;
+    let k = ui.label(&r.label);
+    let v = ui.label(&r.shown);
+    for resp in [k, v] {
+        resp.context_menu(|ui| {
+            if ui.button("Copy value").clicked() {
+                action = Some(PanelAction::Copy(r.value(), r.label.to_lowercase()));
+            }
+            if ui.button("Copy row").clicked() {
+                action = Some(PanelAction::Copy(r.line(), format!("row \"{}\"", r.label)));
+            }
+            if ui.button("Copy all").clicked() {
+                action = Some(PanelAction::Copy(all.to_string(), what.to_string()));
+            }
+        });
+    }
+    ui.end_row();
+    action
+}
+
+fn profile_rows(p: &ColumnProfile) -> Vec<StatRow> {
+    let int = |label: &str, n: usize| StatRow::new(label, fmt_int(n), &[&n.to_string()]);
+    let mut rows = vec![StatRow::same("Type", p.dtype.clone()), int("Rows", p.rows)];
+    rows.push(StatRow::new(
+        "Missing",
+        format!("{} ({:.1}%)", fmt_int(p.missing), p.missing_pct()),
+        &[&p.missing.to_string(), &format!("{:.1}%", p.missing_pct())],
+    ));
+    rows.push(int("Distinct", p.unique));
+    if let Some(n) = &p.numeric {
+        for (k, v) in [
+            ("Min", n.min),
+            ("25%", n.q25),
+            ("Median", n.median),
+            ("Mean", n.mean),
+            ("75%", n.q75),
+            ("Max", n.max),
+            ("Std. dev.", n.std),
+        ] {
+            rows.push(StatRow::same(k, fmt_num(v)));
+        }
+        let mut counts = vec![("Zeros", n.zeros), ("Negative", n.negatives)];
+        if n.nan > 0 {
+            counts.push(("NaN", n.nan));
+        }
+        for (k, v) in counts {
+            rows.push(int(k, v));
+        }
+    }
+    if let Some((a, b)) = &p.min_max {
+        rows.push(StatRow::same("First (sorted)", a.clone()));
+        rows.push(StatRow::same("Last (sorted)", b.clone()));
+    }
+    if let Some((a, b)) = p.text_len {
+        rows.push(StatRow::new("Length", format!("{a} – {b} characters"), &[&a.to_string(), &b.to_string()]));
+    }
+    rows
+}
+
+/// Histogram bar `i` as (from, to); `to` is `None` when each bar is one value.
+fn hist_bin(n: &stats::NumericStats, i: usize) -> (f64, Option<f64>) {
+    let one_per_value = n.min.fract() == 0.0 && (n.max - n.min) as usize + 1 == n.hist.len();
+    if one_per_value {
+        (n.min + i as f64, None)
+    } else {
+        let w = (n.max - n.min) / n.hist.len() as f64;
+        let lo = n.min + w * i as f64;
+        (lo, Some(lo + w))
+    }
+}
+
+/// Everything the column summary shows, as tab-separated text.
+fn profile_text(p: &ColumnProfile) -> String {
+    use grid::tsv_field;
+    let mut out = format!("Column\t{}\n", tsv_field(&p.name));
+    for r in profile_rows(p) {
+        out.push_str(&r.line());
+        out.push('\n');
+    }
+    if !p.top.is_empty() {
+        let total = (p.rows - p.missing).max(1) as f64;
+        out.push_str("\nMost frequent values\tRows\tShare\n");
+        for (v, n) in &p.top {
+            out.push_str(&format!("{}\t{n}\t{:.1}%\n", tsv_field(v), *n as f64 * 100.0 / total));
+        }
+    }
+    if let Some(n) = &p.numeric {
+        let single = hist_bin(n, 0).1.is_none();
+        out.push_str(if single { "\nValue\tRows\n" } else { "\nFrom\tTo\tRows\n" });
+        for (i, h) in n.hist.iter().enumerate() {
+            match hist_bin(n, i) {
+                (v, None) => out.push_str(&format!("{}\t{h}\n", fmt_num(v))),
+                (lo, Some(hi)) => out.push_str(&format!("{}\t{}\t{h}\n", fmt_num(lo), fmt_num(hi))),
             }
         }
-        if let Some((a, b)) = &p.min_max {
-            row(ui, "First (sorted)", a.clone());
-            row(ui, "Last (sorted)", b.clone());
-        }
-        if let Some((a, b)) = p.text_len {
-            row(ui, "Length", format!("{a} – {b} characters"));
+    }
+    out
+}
+
+fn dataset_rows(df: &DataFrame, path: &Path) -> Vec<StatRow> {
+    let missing: usize = df.columns().iter().map(|c| c.null_count()).sum();
+    let pct = missing as f64 * 100.0 / (df.height() * df.width()).max(1) as f64;
+    let mut rows = vec![
+        StatRow::new("Rows", fmt_int(df.height()), &[&df.height().to_string()]),
+        StatRow::same("Columns", df.width().to_string()),
+        StatRow::new(
+            "Missing cells",
+            format!("{} ({pct:.1}%)", fmt_int(missing)),
+            &[&missing.to_string(), &format!("{pct:.1}%")],
+        ),
+        StatRow::same("Memory", fmt_bytes(df.estimated_size())),
+    ];
+    if let Ok(meta) = std::fs::metadata(path) {
+        rows.push(StatRow::same("File size", fmt_bytes(meta.len() as usize)));
+    }
+    rows
+}
+
+fn dataset_text(df: &DataFrame, rows: &[StatRow]) -> String {
+    use grid::tsv_field;
+    let mut out = String::new();
+    for r in rows {
+        out.push_str(&r.line());
+        out.push('\n');
+    }
+    out.push_str("\nColumn\tType\tMissing\tMissing %\n");
+    for c in df.columns() {
+        let m = c.null_count();
+        out.push_str(&format!(
+            "{}\t{}\t{m}\t{:.1}%\n",
+            tsv_field(c.name()),
+            stats::dtype_label(c.dtype()),
+            m as f64 * 100.0 / df.height().max(1) as f64
+        ));
+    }
+    out
+}
+
+fn profile_ui(ui: &mut Ui, p: &ColumnProfile) -> Option<PanelAction> {
+    let mut action = None;
+    let all = profile_text(p);
+    egui::Grid::new("profile").num_columns(2).striped(true).show(ui, |ui| {
+        for r in profile_rows(p) {
+            if let Some(a) = stat_row(ui, &r, &all, "column statistics") {
+                action = Some(a);
+            }
         }
     });
 
     if let Some(n) = &p.numeric {
         ui.add_space(10.0);
         ui.label(RichText::new("Distribution").strong());
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 120.0), egui::Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 120.0), egui::Sense::click());
         let painter = ui.painter_at(rect);
         let max = *n.hist.iter().max().unwrap_or(&1) as f32;
         let bw = rect.width() / n.hist.len() as f32;
@@ -2060,16 +2560,24 @@ fn profile_ui(ui: &mut Ui, p: &ColumnProfile) {
             }
             painter.rect_filled(bar, 2.0, if is_hover { accent } else { accent.gamma_multiply(0.75) });
         }
-        if let Some((i, h)) = hovered {
-            let one_per_value = n.min.fract() == 0.0 && (n.max - n.min) as usize + 1 == n.hist.len();
-            if one_per_value {
-                resp.on_hover_text(format!("{}: {} rows", fmt_num(n.min + i as f64), fmt_int(h as usize)));
-            } else {
-                let w = (n.max - n.min) / n.hist.len() as f64;
-                let lo = n.min + w * i as f64;
-                resp.on_hover_text(format!("{} – {}: {} rows", fmt_num(lo), fmt_num(lo + w), fmt_int(h as usize)));
+        let resp = match hovered {
+            Some((i, h)) => match hist_bin(n, i) {
+                (v, None) => resp.on_hover_text(format!("{}: {} rows", fmt_num(v), fmt_int(h as usize))),
+                (lo, Some(hi)) => {
+                    resp.on_hover_text(format!("{} – {}: {} rows", fmt_num(lo), fmt_num(hi), fmt_int(h as usize)))
+                }
+            },
+            None => resp,
+        };
+        resp.context_menu(|ui| {
+            if ui.button("Copy distribution").clicked() {
+                let text = all.split("\n\n").last().unwrap_or_default().to_string();
+                action = Some(PanelAction::Copy(text, "distribution".into()));
             }
-        }
+            if ui.button("Copy all").clicked() {
+                action = Some(PanelAction::Copy(all.clone(), "column statistics".into()));
+            }
+        });
         ui.horizontal(|ui| {
             ui.label(RichText::new(fmt_num(n.min)).weak().size(11.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2083,32 +2591,66 @@ fn profile_ui(ui: &mut Ui, p: &ColumnProfile) {
         ui.label(RichText::new("Most frequent values").strong());
         let total = (p.rows - p.missing).max(1) as f32;
         let accent = ui.visuals().hyperlink_color;
+        // Filtering by a listed value needs its text to match the column's
+        // own text form, which holds for text, categories and booleans.
+        let filterable = matches!(p.dtype.as_str(), "text" | "category" | "bool");
         for (v, n) in &p.top {
             let frac = *n as f32 / total;
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
             let painter = ui.painter_at(rect);
             painter.rect_filled(
                 egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height())),
                 3.0,
-                accent.gamma_multiply(0.3),
+                accent.gamma_multiply(if resp.hovered() { 0.45 } else { 0.3 }),
             );
             let label = if v.is_empty() { "(empty)".to_string() } else { v.clone() };
-            painter.text(
+            let count = format!("{} · {:.1}%", fmt_int(*n as usize), frac * 100.0);
+            let count_w = 8.0 * count.len() as f32;
+            painter.with_clip_rect(rect.with_max_x(rect.max.x - count_w)).text(
                 rect.left_center() + egui::vec2(6.0, 0.0),
                 egui::Align2::LEFT_CENTER,
-                label,
+                &label,
                 egui::FontId::proportional(12.5),
                 ui.visuals().text_color(),
             );
             painter.text(
                 rect.right_center() - egui::vec2(6.0, 0.0),
                 egui::Align2::RIGHT_CENTER,
-                format!("{} · {:.1}%", fmt_int(*n as usize), frac * 100.0),
+                count,
                 egui::FontId::proportional(11.5),
                 ui.visuals().weak_text_color(),
             );
+            let resp = resp.on_hover_text(format!("{label}\n{} rows · {:.1}%\nRight-click to copy", fmt_int(*n as usize), frac * 100.0));
+            resp.context_menu(|ui| {
+                if ui.button("Copy value").clicked() {
+                    action = Some(PanelAction::Copy(v.clone(), "value".into()));
+                }
+                if ui.button("Copy value and count").clicked() {
+                    action = Some(PanelAction::Copy(
+                        format!("{}\t{n}\t{:.1}%", grid::tsv_field(v), frac * 100.0),
+                        "value and count".into(),
+                    ));
+                }
+                if ui.button("Copy all values").clicked() {
+                    let mut text = String::from("Value\tRows\tShare\n");
+                    for (v, n) in &p.top {
+                        text.push_str(&format!("{}\t{n}\t{:.1}%\n", grid::tsv_field(v), *n as f32 * 100.0 / total));
+                    }
+                    action = Some(PanelAction::Copy(text, "most frequent values".into()));
+                }
+                if ui.button("Copy all").clicked() {
+                    action = Some(PanelAction::Copy(all.clone(), "column statistics".into()));
+                }
+                if filterable {
+                    ui.separator();
+                    if ui.button("Keep only rows with this value").clicked() {
+                        action = Some(PanelAction::Keep(p.name.clone(), v.clone()));
+                    }
+                }
+            });
         }
     }
+    action
 }
 
 fn apply_theme(ctx: &egui::Context, t: ThemeChoice) {
@@ -2133,11 +2675,28 @@ fn install_fonts(ctx: &egui::Context) {
             added.push(name);
         }
     }
-    if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+    // Elsewhere egui's own font stays first, and a common system font fills
+    // in symbols it lacks (arrows, bullets).
+    if !cfg!(windows) {
+        let fallbacks = [
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ];
+        if let Some(bytes) = fallbacks.iter().find_map(|p| std::fs::read(p).ok()) {
+            fonts.font_data.insert("system-fallback".into(), Arc::new(egui::FontData::from_owned(bytes)));
+            added.push("system-fallback");
+        }
+    }
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let Some(fam) = fonts.families.get_mut(&family) else { continue };
         for (i, n) in added.iter().enumerate() {
-            if *n == "segoe-ui" {
+            if *n == "segoe-ui" && family == egui::FontFamily::Proportional {
                 fam.insert(i, n.to_string());
-            } else {
+            } else if *n != "segoe-ui" {
                 fam.push(n.to_string());
             }
         }
@@ -2182,5 +2741,28 @@ fn fmt_bytes(b: usize) -> String {
         format!("{:.1} KB", b / 1024.0)
     } else {
         format!("{b:.0} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_copies_as_a_table() {
+        let df = df!(
+            "t" => [Some("a"), Some("b\tc"), Some("a"), None],
+            "x" => [1i64, 2, 2, 1500],
+        )
+        .unwrap();
+        let text = profile_text(&stats::profile(&df, "t").unwrap());
+        assert!(text.starts_with("Column\tt\nType\ttext\nRows\t4\nMissing\t1\t25.0%\nDistinct\t3\n"), "{text}");
+        assert!(text.contains("\nMost frequent values\tRows\tShare\na\t2\t66.7%\n\"b\tc\"\t1\t33.3%\n"), "{text}");
+        let text = profile_text(&stats::profile(&df, "x").unwrap());
+        assert!(text.contains("Rows\t4\n") && text.contains("Max\t1500\n"), "no thousands separators: {text}");
+        assert!(text.contains("\nFrom\tTo\tRows\n1\t"), "{text}");
+        let rows = dataset_rows(&df, Path::new(""));
+        assert_eq!(rows[2].value(), "1\t12.5%");
+        assert!(dataset_text(&df, &rows).ends_with("Column\tType\tMissing\tMissing %\nt\ttext\t1\t25.0%\nx\tint64\t0\t0.0%\n"));
     }
 }

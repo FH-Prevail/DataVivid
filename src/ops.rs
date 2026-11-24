@@ -174,6 +174,10 @@ pub enum Op {
     SetCells { column: String, rows: Vec<usize>, values: Vec<Option<String>> },
     Sort { columns: Vec<(String, bool)> },
     Filter { column: String, cmp: Cmp, value: String, case_sensitive: bool },
+    /// Excel-style filter by values: keeps the rows whose value is one of
+    /// `values` or, with `exclude`, removes them. Values are compared as
+    /// text (see `stats::distinct_values`); `None` means a missing value.
+    FilterValues { column: String, values: Vec<Option<String>>, exclude: bool },
     Rename { from: String, to: String },
     DropColumns { columns: Vec<String> },
     /// Adds a column computed from a SQL expression such as `price * qty`;
@@ -230,6 +234,18 @@ impl Op {
                     format!("Keep rows where {column} {}", cmp.label())
                 }
             }
+            Op::FilterValues { column, values, exclude } => {
+                let verb = if *exclude { "Remove" } else { "Keep" };
+                let q = |v: &Option<String>| v.as_deref().map_or("(missing)".into(), |v| format!("\"{}\"", short(v)));
+                match values.as_slice() {
+                    [v] => format!("{verb} rows where {column} = {}", q(v)),
+                    vs if vs.len() <= 3 => format!(
+                        "{verb} rows where {column} is {}",
+                        vs.iter().map(q).collect::<Vec<_>>().join(", ")
+                    ),
+                    vs => format!("{verb} rows where {column} is one of {} values", vs.len()),
+                }
+            }
             Op::Rename { from, to } => format!("Rename {from} → {to}"),
             Op::DropColumns { columns } => format!("Delete column(s) {}", list(columns)),
             Op::AddColumn { name, formula, .. } if formula.trim().is_empty() => format!("Add column {name}"),
@@ -277,6 +293,19 @@ impl Op {
             Op::Filter { column, cmp, value, case_sensitive } => {
                 let pred = filter_expr(df, column, *cmp, value, *case_sensitive)?;
                 df.clone().lazy().filter(pred).collect()?
+            }
+            Op::FilterValues { column, values, exclude } => {
+                df.try_get_column_index(column)?;
+                let texts: Vec<&str> = values.iter().flatten().map(String::as_str).collect();
+                let with_missing = values.iter().any(Option::is_none);
+                let c = col(column.as_str());
+                let hit = c
+                    .clone()
+                    .cast(DataType::String)
+                    .is_in(lit(Series::new("v".into(), texts)).implode(false), false)
+                    .fill_null(lit(false));
+                let hit = if with_missing { hit.or(c.is_null()) } else { hit.and(c.is_not_null()) };
+                df.clone().lazy().filter(if *exclude { hit.not() } else { hit }).collect()?
             }
             Op::Rename { from, to } => {
                 let to = to.trim();
@@ -754,6 +783,31 @@ mod tests {
         assert_eq!(out.column("score").unwrap().get(3).unwrap(), AnyValue::Null);
         let d = Op::DropDuplicates { columns: vec!["name".into(), "score".into()] };
         assert_eq!(d.apply(&df).unwrap().height(), 3);
+    }
+
+    #[test]
+    fn filter_by_values() {
+        let df = sample();
+        let keep = |values: Vec<Option<&str>>, exclude: bool, column: &str| {
+            let values = values.into_iter().map(|v| v.map(String::from)).collect();
+            Op::FilterValues { column: column.into(), values, exclude }.apply(&df).unwrap()
+        };
+        let out = keep(vec![Some("Anna")], false, "name");
+        assert_eq!(out.height(), 2);
+        let out = keep(vec![Some("Anna"), None], false, "name");
+        assert_eq!(out.height(), 3);
+        let out = keep(vec![None], true, "name");
+        assert_eq!(out.height(), 3);
+        let out = keep(vec![Some("Anna")], true, "name");
+        assert_eq!(out.height(), 2, "exclude keeps missing values");
+        // Numbers and missing values use the labels the filter list shows.
+        let items = crate::stats::distinct_values(&df, "score").unwrap();
+        assert_eq!(items, vec![(Some("1.5".into()), 2), (Some("2.25".into()), 1), (None, 1)]);
+        let out = keep(vec![Some("2.25")], false, "score");
+        assert_eq!(out.column("id").unwrap().i64().unwrap().get(0), Some(2));
+        let ids = crate::stats::distinct_values(&df, "id").unwrap();
+        assert_eq!(ids[0], (Some("1".into()), 1));
+        assert_eq!(keep(vec![Some("3"), Some("4")], false, "id").height(), 2);
     }
 
     #[test]
