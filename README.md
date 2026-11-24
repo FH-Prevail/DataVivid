@@ -169,6 +169,21 @@ SQLite databases are never overwritten in place (*Save* becomes *Save as*).
   puts all of it on the clipboard as a table that pastes into Excel;
   right-click any value, a frequent value or the histogram to copy just that
   (or to keep only the rows with a frequent value).
+- **Chart panel** (under the grid, *View > Chart panel*): a quick chart of
+  the selected column, or of the first and last column of a selected range;
+  X and Y can also be picked by hand. The chart follows the column types:
+  - a number column gives a histogram, a text column the row count per value
+    (top 24, the rest as Other, missing values as their own bar), a date
+    column the rows per day, week, month, quarter or year;
+  - two number columns give a scatter plot with the correlation (at most
+    50,000 points, a random sample of larger tables);
+  - a text and a number column give the mean, sum, median, minimum,
+    maximum or row count per category, or box plots of the spread;
+  - a date and a number column give a line of that value per period.
+
+  Clicking a bar keeps only the rows with that value (an undoable step).
+  *Copy data* copies the numbers behind the chart. Everything is aggregated
+  in the background before drawing, so charts of a million rows stay quick.
 - **Safe saving**: writes to a temporary file first and then replaces the
   original, so a failed save never destroys your data. Unsaved changes are
   never discarded without asking.
@@ -300,6 +315,7 @@ Unsigned apps need a right-click > *Open* on first start (Gatekeeper).
 | `src/history.rs` | undo/redo snapshots |
 | `src/io.rs` | readers/writers, CSV sniffing, encodings, safe save |
 | `src/stats.rs` | column profiles for headers and the summary panel |
+| `src/chart.rs` | chart panel: aggregation and drawing (egui_plot) |
 | `src/formats.rs` | format/extension table |
 | `src/winassoc.rs` | file-type registration: Windows (HKCU) and the shared API |
 | `src/linuxassoc.rs` | file-type registration on Linux (desktop entry, icons, MIME) |

@@ -11,6 +11,7 @@ use anyhow::{Result, anyhow};
 use egui::{Color32, Id, Key, KeyboardShortcut, Modifiers, RichText, Ui};
 use polars::prelude::*;
 
+use crate::chart;
 use crate::formats::{self, Format};
 use crate::grid::{self, ColumnCommand, GridAction, GridState};
 use crate::history::History;
@@ -55,11 +56,12 @@ struct Settings {
     theme: ThemeChoice,
     show_ops: bool,
     show_summary: bool,
+    show_chart: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { recent: Vec::new(), theme: ThemeChoice::System, show_ops: true, show_summary: true }
+        Settings { recent: Vec::new(), theme: ThemeChoice::System, show_ops: true, show_summary: true, show_chart: true }
     }
 }
 
@@ -287,6 +289,9 @@ pub struct App {
     preview: Option<Preview>,
     dialog: Option<Dialog>,
     value_filter: Option<ValueFilter>,
+    chart: chart::ChartState,
+    /// Counts loaded files, so charts of different files never mix.
+    loads: u64,
     status: Option<(String, bool, Instant)>,
     title: String,
     reg_status: winassoc::Status,
@@ -320,6 +325,8 @@ impl App {
             preview: None,
             dialog: None,
             value_filter: None,
+            chart: chart::ChartState::default(),
+            loads: 0,
             status: None,
             title: String::new(),
             reg_status: winassoc::status(),
@@ -392,6 +399,8 @@ impl App {
         request.table = loaded.table.clone();
         let shape = loaded.df.shape();
         let note = loaded.notes.join("; ");
+        self.loads += 1;
+        self.chart.reset();
         self.doc = Some(Doc {
             path: path.clone(),
             format: request.format,
@@ -584,6 +593,9 @@ impl App {
         let before = doc.df().shape();
         let t = Instant::now();
         match op.apply(doc.df()) {
+            Ok(df) if matches!(op, Op::Filter { .. } | Op::FilterValues { .. }) && df.height() == before.0 => {
+                self.info(format!("Every row already matches, nothing to filter ({})", op.describe()));
+            }
             Ok(df) => {
                 let after = df.shape();
                 let desc = op.describe();
@@ -1149,6 +1161,13 @@ impl eframe::App for App {
                     .size_range(220.0..=560.0)
                     .show(ui, |ui| self.summary_panel(ui));
             }
+            if self.settings.show_chart {
+                egui::Panel::bottom("chart")
+                    .resizable(true)
+                    .default_size(300.0)
+                    .size_range(140.0..=900.0)
+                    .show(ui, |ui| self.chart_panel(ui));
+            }
         }
 
         egui::CentralPanel::default()
@@ -1291,6 +1310,7 @@ impl App {
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut self.settings.show_ops, "Operations & steps panel");
                 ui.checkbox(&mut self.settings.show_summary, "Summary panel");
+                ui.checkbox(&mut self.settings.show_chart, "Chart panel");
                 ui.separator();
                 let before = self.settings.theme;
                 ui.radio_value(&mut self.settings.theme, ThemeChoice::System, "Follow Windows theme");
@@ -1413,6 +1433,7 @@ impl App {
 
     fn close_doc(&mut self) {
         self.doc = None;
+        self.chart.reset();
         self.preview = None;
         self.profiles.clear();
         self.profiles_for = None;
@@ -2067,6 +2088,34 @@ impl App {
                     self.apply(Op::FilterValues { column, values: vec![Some(value)], exclude: false });
                 }
             }
+            None => {}
+        }
+    }
+
+    // ---- chart panel ------------------------------------------------------
+
+    fn chart_panel(&mut self, ui: &mut Ui) {
+        let Some(doc) = &self.doc else { return };
+        let df = doc.df().clone();
+        let version = doc.history.version();
+        let names: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        let sel = if self.grid.whole_rows {
+            None
+        } else {
+            self.grid.selection(df.height().max(1), df.width()).map(|(_, _, c0, c1)| (c0, c1))
+        };
+        self.chart.follow_selection(&names, sel, version);
+        self.chart.update(&df, self.loads, version, ui.ctx());
+        match self.chart.ui(ui, &df, self.preview.is_some()) {
+            Some(chart::Action::Apply(op)) => {
+                if self.preview.is_some() {
+                    self.error("Apply or discard the preview first");
+                } else {
+                    self.apply(op);
+                }
+            }
+            Some(chart::Action::Copied(m)) => self.info(m),
+            Some(chart::Action::Hide) => self.settings.show_chart = false,
             None => {}
         }
     }

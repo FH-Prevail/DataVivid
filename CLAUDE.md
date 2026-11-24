@@ -14,7 +14,30 @@ User-facing documentation is in `README.md`.
   "Open with" or default app. Linux is supported since 2026-11-23 (same
   single binary, XDG registration); macOS is planned (see README).
 
-## Status (v0.1.3, 2026-11-24)
+## Status (v0.1.4, in progress 2026-11-24)
+
+v0.1.4 adds the chart panel (`chart.rs`, egui_plot 0.38), step 1 of the
+plan agreed with Sina:
+
+- Single-column and two-column charts, click-to-filter on category bars, and
+  Copy data.
+- Codex (gpt-6-astra, read-only) reviewed it; the accepted points are fixed:
+  - the load counter in the request;
+  - one worker at a time;
+  - stale charts are faded and not clickable;
+  - exact numbers in the copy;
+  - "no values" instead of 0 for empty groups;
+  - Welford correlation and a seeded reservoir sample;
+  - running totals per period;
+  - zero only on bar axes;
+  - a missing-values bar outside "Other";
+  - a note when a preview is open.
+- Also: `App::apply` skips Filter/FilterValues ops that remove no rows (a
+  second click on the same bar used to add a duplicate step).
+- Tested on Linux/X11 with the 1M-row CSV: every chart type, click-to-filter
+  (including clicks beside a bar), tooltips, Copy data. 25 unit tests pass.
+
+### v0.1.3 (2026-11-24)
 
 v0.1.3 (asked for by a colleague of Sina's) adds:
 
@@ -250,6 +273,7 @@ Not done or known gaps:
 | `ops.rs` | `Op` enum. Every data change (including cell edits and pastes) is an `Op` with `describe()` and `apply(&DataFrame) -> Result<DataFrame>`. `Op::Batch` groups multi-column changes. `SetCells` builds a full-length mask and value column and uses `when/then/otherwise`, so it validates types strictly. |
 | `history.rs` | Undo/redo as a list of `(Op, DataFrame-after)` snapshots. This is cheap because Polars columns are Arc-shared. It keeps at most 200 steps, folding the oldest into the base. `version()` increments on every change and drives cache invalidation. It tracks the dirty state against the saved cursor. |
 | `io.rs` | `load(LoadRequest) -> Loaded` and `save(df, path, SaveOptions)`. See the delimited-text, spreadsheet and SQLite notes below this table. |
+| `chart.rs` | Chart panel. `compute(df, Request) -> ChartData` picks the chart from the column kinds (`Kind::{Number, Time, Category, Other}`) and aggregates before drawing: histogram (two passes, no copy), counts (Polars group_by, top 24 + Other, missing always its own bar), groups (Polars group_by; quantiles only for the box plot), over time (dates bucketed in Rust with Hinnant's civil-date math, running totals per period, values kept only for the median), scatter (seeded reservoir sample of `MAX_POINTS` = 50,000, Welford correlation). `ChartState` runs one background computation at a time (Polars can't cancel); `Request` holds `doc` (load counter) + history version + settings, and a stale chart is faded and not clickable. Horizontal category charts and vertical bars draw their own pointer tooltips (`category_plot`, `column_bars`) because egui_plot puts hover labels at the bar end, where they get cut off. Click on a category bar/box returns `Action::Apply(Op::FilterValues)`. `to_tsv` copies with `exact()` (round-trip) numbers; `num()` is the short display form. |
 | `stats.rs` | `ColumnProfile`: missing, distinct, quantiles, mean/std, histogram (one bin per value for small integer ranges), top values, min/max, text length. Computed in a background thread per history version, selected column first; stale runs cancel via an `AtomicU64` generation. |
 | `formats.rs` | Format enum ↔ extensions, labels, ProgID keys, `can_write`. |
 | `linuxassoc.rs` | Linux implementation of the `winassoc` API (pulled in with `#[path]` as `winassoc::imp`). It writes `$XDG_DATA_HOME/applications/datavivid.desktop` (with an `X-DataVivid-Path` key for `status()`), PNG icons into `icons/hicolor` (its own small PNG encoder using flate2), and `mime/packages/datavivid.xml` for Parquet, Arrow, Avro, JSON Lines and `*.sqlite`, then runs the update-*-database tools. `choose_defaults()` runs `xdg-mime default` for `DEFAULT_MIME` (not JSON, Excel or ODS). On Linux the app_id is `datavivid` (`winassoc::LINUX_APP_ID`), so settings live in `~/.local/share/datavivid`. Never put `--` inside the XML comment, because update-mime-database rejects the whole file (a test guards this). |
@@ -327,6 +351,14 @@ polars 0.55:
 - `.context()` is ambiguous between anyhow and polars, so use
   `.map_err(anyhow::Error::from).context(..)`.
 - `DataType::Object` doesn't exist without the `object` feature.
+
+egui_plot 0.38 (the release built on egui 0.37; its versions don't follow egui's):
+
+- `HoverPosition` is an enum (`NearDataPoint { position, .. }` / `Elsewhere`).
+- Items take `.allow_hover(false)`; `Plot::show_x/show_y(false)` hide the
+  coordinate readout.
+- `BoxElem` needs an explicit `.stroke(..)`, or the whiskers and median line
+  don't show when a fill is set.
 
 Other crates:
 
@@ -428,5 +460,5 @@ Notes:
    the grid reading slices.
 4. Export the steps as Python (pandas/Polars) code; Ops are already a
    replayable recipe.
-5. Group-by, pivot, and join/merge UIs; charts.
+5. Group-by, pivot, and join/merge UIs. Charts step 2/3 (planned with Sina, 2026-11-24): click a histogram bin or a period to filter a range; correlation heatmap; missing-values map; save a chart as PNG; break lines across empty periods.
 6. Code-sign the setup and exe (SmartScreen); smaller exe (fat LTO, trimming Polars features).
