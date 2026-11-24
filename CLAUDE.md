@@ -54,6 +54,20 @@ v0.1.3 (asked for by a colleague of Sina's) adds:
   a 134k-value list, Escape and click-outside, all copy entries (checked
   with xclip), keep-only, Ctrl+Z/Ctrl+Y, and Ctrl+Z inside the cell
   editor.
+- **Published 2026-11-24:**
+  https://github.com/FH-Prevail/DataVivid/releases/tag/v0.1.3 (tag on
+  `0f030c7`, run 45440981048). It was tagged without a manual `main` run
+  first, because Cargo.lock dependencies were unchanged and main's cache was
+  still valid.
+  - Anonymous downloads of all 5 files pass `sha256sum -c`.
+  - SHA-256:
+    - setup `4bfc9ff00cb4af4d42f7a0a264e9ba8a061fdd98ed202ad702ceec75347bff0e`
+    - zip `89b7cf3783dbf17362daaa80f468ddd34a9252d1a467a02845daa10c6e4abdbe`
+    - exe `2ac051f1380ac6a595d55e503318f4d663fc0a48848588b77afbaf458c5c1204`
+    - tarball `dbdce489b079ad7de45305fc76b75d2f6e757d907d5677c8ab52c0405145174f`
+    - Linux binary `7e54c32da284e2b2851abeb8c8351575ad5d61633554008c117b186a1d7d127f`
+  - The Linux laptop runs 0.1.3 from the tarball. The Windows GUI has not
+    been tested by hand.
 
 ### v0.1.2 (2026-11-23)
 
