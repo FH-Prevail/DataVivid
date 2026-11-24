@@ -14,7 +14,7 @@ User-facing documentation is in `README.md`.
   "Open with" or default app. Linux is supported since 2026-11-23 (same
   single binary, XDG registration); macOS is planned (see README).
 
-## Status (v0.1.4, in progress 2026-11-24)
+## Status (v0.1.4, 2026-11-24)
 
 v0.1.4 adds the chart panel (`chart.rs`, egui_plot 0.38), step 1 of the
 plan agreed with Sina:
@@ -36,6 +36,18 @@ plan agreed with Sina:
   second click on the same bar used to add a duplicate step).
 - Tested on Linux/X11 with the 1M-row CSV: every chart type, click-to-filter
   (including clicks beside a bar), tooltips, Copy data. 25 unit tests pass.
+- **Published 2026-11-24:**
+  https://github.com/FH-Prevail/DataVivid/releases/tag/v0.1.4 (tag on
+  `a3e5318`, run 45465737115).
+  - Anonymous downloads of all 5 files pass `sha256sum -c`.
+  - SHA-256:
+    - setup `ff71c21b9199f780df137af50371dad5ce991fc3bc1a51ec14866ecd60017973`
+    - zip `156b19e2aecfb005cad6f7b4327b26b02484b7d08971dbef797bcce8efc4170e`
+    - exe `c28382ed2a1c5815049c828aeb52701d26bd15f620a369db39a4e9f06686b18c`
+    - tarball `58bea7c4a89df9ed3d3f66b7aa2225b7754fd5245e6ba2c17b5ed44447f88e84`
+    - Linux binary `c5a5f710516b7d157b1af57239f1507331d4d2ca4ed630b558bdc36e4bf98d8b`
+  - The Linux laptop runs 0.1.4 from the tarball. The chart panel has not
+    been tried on Windows by hand.
 
 ### v0.1.3 (2026-11-24)
 
