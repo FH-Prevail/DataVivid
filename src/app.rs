@@ -72,6 +72,9 @@ enum ThemeChoice {
     Dark,
 }
 
+/// The open file. `request`, `history`, `loaded_shape`, `load_time` and `id`
+/// belong to the sheet on screen (`table`); the other sheets that were opened
+/// wait in `parked`.
 struct Doc {
     path: PathBuf,
     format: Format,
@@ -82,6 +85,42 @@ struct Doc {
     history: History,
     loaded_shape: (usize, usize),
     load_time: Duration,
+    /// Number of the table on screen. No two loaded tables share one, so a
+    /// chart is never taken for the chart of another sheet.
+    id: u64,
+    /// Number of this file among the opened ones. A sheet read in the
+    /// background is dropped if another file was opened meanwhile.
+    serial: u64,
+    /// Sheets that were opened before and are off screen now, with their
+    /// changes and steps. Going back to one is instant and loses nothing;
+    /// nothing is written to disk until the user saves.
+    parked: HashMap<String, Parked>,
+}
+
+/// A sheet of the open file that is not on screen.
+struct Parked {
+    request: LoadRequest,
+    history: History,
+    loaded_shape: (usize, usize),
+    load_time: Duration,
+    id: u64,
+    grid: grid::GridView,
+    /// `None` until the sheet has been on screen.
+    chart: Option<chart::ChartState>,
+    profiles: HashMap<String, ColumnProfile>,
+    profiles_for: Option<u64>,
+}
+
+/// What a save writes, which decides what counts as saved afterwards.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SaveScope {
+    /// The table of a file that holds one. The document moves to that file.
+    Table,
+    /// Every sheet of a workbook, into one `.xlsx`.
+    Workbook,
+    /// One sheet of several, into a file of its own. The open file stays
+    /// the document, and its other sheets are not in the written file.
+    Sheet,
 }
 
 impl Doc {
@@ -90,6 +129,183 @@ impl Doc {
     }
     fn name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+    /// "sheet" or "table", as the file calls its parts.
+    fn noun(&self) -> &'static str {
+        if self.format == Format::Sqlite { "table" } else { "sheet" }
+    }
+    /// A spreadsheet with several sheets, which is saved as a whole.
+    fn is_workbook(&self) -> bool {
+        matches!(self.format, Format::Excel | Format::Ods) && self.tables.len() > 1
+    }
+
+    /// The steps of a sheet that is in memory.
+    fn sheet(&self, table: Option<&str>) -> Option<&History> {
+        if table == self.table.as_deref() { Some(&self.history) } else { self.parked.get(table?).map(|p| &p.history) }
+    }
+    fn sheet_mut(&mut self, table: Option<&str>) -> Option<(&mut History, &mut LoadRequest)> {
+        if table == self.table.as_deref() {
+            Some((&mut self.history, &mut self.request))
+        } else {
+            self.parked.get_mut(table?).map(|p| (&mut p.history, &mut p.request))
+        }
+    }
+
+    /// Makes `name` the sheet on screen, with the table and steps in
+    /// `sheet`. `sheet` gets those of the sheet that was on screen, whose
+    /// name is returned.
+    fn swap_sheet(&mut self, name: String, sheet: &mut Parked) -> Option<String> {
+        std::mem::swap(&mut self.request, &mut sheet.request);
+        std::mem::swap(&mut self.history, &mut sheet.history);
+        std::mem::swap(&mut self.loaded_shape, &mut sheet.loaded_shape);
+        std::mem::swap(&mut self.load_time, &mut sheet.load_time);
+        std::mem::swap(&mut self.id, &mut sheet.id);
+        self.table.replace(name)
+    }
+    /// Keeps a sheet that left the screen. One that was replaced by a new
+    /// reading of itself is dropped.
+    fn park(&mut self, name: Option<String>, sheet: Parked) {
+        if let Some(name) = name.filter(|n| Some(n) != self.table.as_ref()) {
+            self.parked.insert(name, sheet);
+        }
+    }
+
+    /// Unsaved changes on any sheet, also the ones off screen.
+    fn is_dirty(&self) -> bool {
+        self.history.is_dirty() || self.parked.values().any(|p| p.history.is_dirty())
+    }
+    /// The sheets with unsaved changes, in tab order.
+    fn dirty_sheets(&self) -> Vec<String> {
+        self.tables.iter().filter(|t| self.sheet(Some(t.as_str())).is_some_and(|h| h.is_dirty())).cloned().collect()
+    }
+
+    fn save_scope(&self, format: Format) -> SaveScope {
+        if self.tables.len() <= 1 {
+            SaveScope::Table
+        } else if format == Format::Excel && self.is_workbook() {
+            SaveScope::Workbook
+        } else {
+            SaveScope::Sheet
+        }
+    }
+
+    /// The sheets of the workbook as they go into an `.xlsx`, and which of
+    /// them are written from memory (with their history version). A sheet
+    /// that is as in the file, or was never opened, is copied from the file.
+    fn workbook_sheets(&self) -> (Vec<io::SheetOut>, Vec<(Option<String>, u64)>) {
+        let mut written = Vec::new();
+        let sheets = self
+            .tables
+            .iter()
+            .zip(io::xlsx_sheet_names(&self.tables))
+            .map(|(source, name)| {
+                let changed = self.sheet(Some(source.as_str())).filter(|h| h.differs_from_file());
+                if let Some(h) = changed {
+                    written.push((Some(source.clone()), h.version()));
+                }
+                io::SheetOut { name, source: source.clone(), df: changed.map(|h| h.current().clone()) }
+            })
+            .collect();
+        (sheets, written)
+    }
+
+    /// Gives the sheets the names they have in the workbook just written.
+    fn rename_sheets(&mut self, names: Vec<String>) {
+        if names.len() != self.tables.len() {
+            return;
+        }
+        let old = std::mem::replace(&mut self.tables, names);
+        let renamed = |name: &str| old.iter().position(|o| o == name).map(|i| self.tables[i].clone());
+        if let Some(new) = self.table.as_deref().and_then(renamed) {
+            self.request.table = Some(new.clone());
+            self.table = Some(new);
+        }
+        let parked = std::mem::take(&mut self.parked);
+        for (name, mut p) in parked {
+            let new = renamed(&name).unwrap_or(name);
+            p.request.table = Some(new.clone());
+            self.parked.insert(new, p);
+        }
+    }
+
+    /// Records a finished save and returns the line for the status bar.
+    fn finish_save(&mut self, save: SaveJob) -> String {
+        let SaveJob { path, opts, scope, written, names } = save;
+        let format = opts.format;
+        // What was written is saved, unless it changed while the file was
+        // being written: then the file holds a table that is not on screen.
+        for (table, version) in &written {
+            let Some((history, request)) = self.sheet_mut(table.as_deref()) else { continue };
+            let unchanged = history.version() == *version;
+            match scope {
+                SaveScope::Sheet if unchanged => history.mark_exported(),
+                SaveScope::Sheet => {}
+                _ if unchanged => history.mark_saved(),
+                _ => history.mark_unsaved(),
+            }
+            if scope != SaveScope::Sheet {
+                // The file now starts with a header row, whatever it had before.
+                request.csv.has_header = true;
+                request.csv.skip_rows = 0;
+            }
+        }
+        match scope {
+            SaveScope::Sheet => format!(
+                "Exported the {} '{}' to {} (the other {}s are not in that file)",
+                self.noun(),
+                written.first().and_then(|(t, _)| t.clone()).unwrap_or_default(),
+                path.display(),
+                self.noun()
+            ),
+            SaveScope::Workbook => {
+                self.rename_sheets(names);
+                self.move_to(&path, format);
+                format!("Saved {} with all {} sheets", path.display(), self.tables.len())
+            }
+            SaveScope::Table => {
+                if path != self.path {
+                    // The document now lives in the new file.
+                    self.move_to(&path, format);
+                    if !format.is_delimited() {
+                        self.csv = None;
+                    }
+                    if !matches!(format, Format::Excel | Format::Sqlite) {
+                        // Not a file with named sheets any more.
+                        self.tables.clear();
+                        self.table = None;
+                        self.request.table = None;
+                    }
+                }
+                let mut note = String::new();
+                if format.is_delimited() {
+                    if let Some(c) = &mut self.csv {
+                        if !c.encoding.starts_with("UTF-8") {
+                            note = format!(" (as UTF-8 with BOM; the original was {})", c.encoding);
+                            c.encoding = "UTF-8";
+                        }
+                        c.separator = opts.separator;
+                        c.had_bom = opts.bom;
+                        c.decimal_comma = opts.decimal_comma;
+                    }
+                    // The file on disk is now UTF-8 in DataVivid's own dialect, so a
+                    // reload should detect it afresh rather than reuse old overrides.
+                    self.request.csv.encoding = TextEncoding::Auto;
+                    self.request.csv.separator = None;
+                    self.request.csv.decimal_comma = None;
+                }
+                format!("Saved {}{note}", path.display())
+            }
+        }
+    }
+
+    /// The document now lives in `path`.
+    fn move_to(&mut self, path: &Path, format: Format) {
+        self.path = path.to_path_buf();
+        self.format = format;
+        for request in std::iter::once(&mut self.request).chain(self.parked.values_mut().map(|p| &mut p.request)) {
+            request.path = path.to_path_buf();
+            request.format = format;
+        }
     }
 }
 
@@ -102,9 +318,20 @@ struct Preview {
 /// What to do after the user confirmed discarding unsaved changes.
 #[derive(Clone)]
 enum After {
-    Open(LoadRequest),
+    Load(LoadRequest, LoadKind),
     Close,
     Quit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoadKind {
+    /// Opens a file, or reads the open one again: replaces everything.
+    Open,
+    /// Another sheet of the open file. The others stay in memory.
+    Sheet,
+    /// The sheet on screen again, with other import options. The other
+    /// sheets keep their changes.
+    Reimport,
 }
 
 enum Dialog {
@@ -272,8 +499,27 @@ enum ValueFilterAction {
 }
 
 enum Job {
-    Load { rx: Receiver<Result<Loaded>>, path: PathBuf, started: Instant },
-    Save { rx: Receiver<Result<()>>, path: PathBuf, opts: SaveOptions, version: u64 },
+    Load {
+        rx: Receiver<Result<Loaded>>,
+        path: PathBuf,
+        started: Instant,
+        kind: LoadKind,
+        /// `Doc::serial` of the file a sheet is read for.
+        serial: u64,
+        table: Option<String>,
+    },
+    Save { rx: Receiver<Result<()>>, save: SaveJob },
+}
+
+struct SaveJob {
+    path: PathBuf,
+    opts: SaveOptions,
+    scope: SaveScope,
+    /// The sheets written from memory, with their history version when the
+    /// save started: one that changed since is not saved after all.
+    written: Vec<(Option<String>, u64)>,
+    /// For a workbook: the sheet names in the written file, in tab order.
+    names: Vec<String>,
 }
 
 pub struct App {
@@ -290,8 +536,10 @@ pub struct App {
     dialog: Option<Dialog>,
     value_filter: Option<ValueFilter>,
     chart: chart::ChartState,
-    /// Counts loaded files, so charts of different files never mix.
+    /// Counts loaded tables, so charts of different files or sheets never mix.
     loads: u64,
+    /// Scroll the tab of the sheet on screen into view.
+    reveal_tab: bool,
     status: Option<(String, bool, Instant)>,
     title: String,
     reg_status: winassoc::Status,
@@ -327,6 +575,7 @@ impl App {
             value_filter: None,
             chart: chart::ChartState::default(),
             loads: 0,
+            reveal_tab: false,
             status: None,
             title: String::new(),
             reg_status: winassoc::status(),
@@ -374,26 +623,55 @@ impl App {
     }
 
     fn request_open(&mut self, req: LoadRequest, ctx: &egui::Context) {
-        if self.doc.as_ref().is_some_and(|d| d.history.is_dirty()) {
-            self.dialog = Some(Dialog::Discard(After::Open(req)));
+        self.request_load(req, LoadKind::Open, ctx);
+    }
+
+    fn request_load(&mut self, req: LoadRequest, kind: LoadKind, ctx: &egui::Context) {
+        let after = After::Load(req, kind);
+        if self.unsaved_before(&after) {
+            self.dialog = Some(Dialog::Discard(after));
         } else {
-            self.start_load(req, ctx);
+            self.continue_after(after, ctx);
         }
     }
 
-    fn start_load(&mut self, req: LoadRequest, ctx: &egui::Context) {
+    /// Whether `after` would drop changes that are not saved. Changes on a
+    /// sheet that is off screen count as much as those on screen.
+    fn unsaved_before(&self, after: &After) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        match after {
+            After::Load(_, LoadKind::Sheet) => false,
+            After::Load(_, LoadKind::Reimport) => doc.history.is_dirty(),
+            After::Load(_, LoadKind::Open) | After::Close | After::Quit => doc.is_dirty(),
+        }
+    }
+
+    fn start_load(&mut self, req: LoadRequest, kind: LoadKind, ctx: &egui::Context) {
         let (tx, rx) = channel();
         let path = req.path.clone();
+        let table = req.table.clone();
+        let serial = self.doc.as_ref().map_or(0, |d| d.serial);
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(io::load(req));
             ctx2.request_repaint();
         });
-        self.job = Some(Job::Load { rx, path, started: Instant::now() });
-        self.preview = None;
+        self.job = Some(Job::Load { rx, path, started: Instant::now(), kind, serial, table });
+        if kind != LoadKind::Sheet {
+            self.preview = None;
+        }
     }
 
-    fn finish_load(&mut self, loaded: Loaded, started: Instant) {
+    fn finish_load(&mut self, loaded: Loaded, started: Instant, kind: LoadKind, serial: u64) {
+        match kind {
+            LoadKind::Open => self.open_loaded(loaded, started),
+            // The file was closed or replaced while the sheet was read.
+            _ if self.doc.as_ref().is_none_or(|d| d.serial != serial) => {}
+            _ => self.sheet_loaded(loaded, started, kind),
+        }
+    }
+
+    fn open_loaded(&mut self, loaded: Loaded, started: Instant) {
         let path = loaded.request.path.clone();
         let mut request = loaded.request.clone();
         request.table = loaded.table.clone();
@@ -411,12 +689,18 @@ impl App {
             history: History::new(loaded.df),
             loaded_shape: shape,
             load_time: started.elapsed(),
+            id: self.loads,
+            serial: self.loads,
+            parked: HashMap::new(),
         });
         self.grid.reset();
         self.profiles.clear();
         self.profiles_for = None;
+        self.value_filter = None;
         self.form.column.clear();
         self.form.columns.clear();
+        self.form.cast_check = None;
+        self.reveal_tab = true;
         self.settings.recent.retain(|p| p != &path);
         self.settings.recent.insert(0, path);
         self.settings.recent.truncate(MAX_RECENT);
@@ -427,6 +711,130 @@ impl App {
             shape.1,
             if note.is_empty() { String::new() } else { format!(" — {note}") }
         ));
+    }
+
+    // ---- sheets -----------------------------------------------------------
+
+    /// Shows another sheet of the open file. One that was open before comes
+    /// back as it was left. Otherwise it is read from the file in the
+    /// background, while the current sheet stays on screen.
+    fn switch_sheet(&mut self, name: &str, ctx: &egui::Context) {
+        let Some(doc) = &mut self.doc else { return };
+        if !doc.tables.iter().any(|t| t == name) {
+            return;
+        }
+        // The newest choice wins over a sheet that is still being read.
+        let reading_sheet = matches!(self.job, Some(Job::Load { kind: LoadKind::Sheet, .. }));
+        if doc.table.as_deref() == Some(name) {
+            // Choosing the sheet on screen means staying here after all.
+            if reading_sheet {
+                self.job = None;
+            }
+            return;
+        }
+        if let Some(parked) = doc.parked.remove(name) {
+            if reading_sheet {
+                self.job = None;
+            }
+            self.show_sheet(name.to_string(), parked);
+            return;
+        }
+        if self.job.is_some() && !reading_sheet {
+            let noun = doc.noun();
+            self.info(format!("One moment, the file is being read or written. Then choose the {noun} again."));
+            return;
+        }
+        let mut req = doc.request.clone();
+        req.table = Some(name.to_string());
+        self.start_load(req, LoadKind::Sheet, ctx);
+    }
+
+    /// Goes to the next (`by` = 1) or previous (-1) sheet.
+    fn step_sheet(&mut self, by: isize, ctx: &egui::Context) {
+        let Some(doc) = &self.doc else { return };
+        // Counted from the sheet that is on its way, so pressing twice moves two.
+        let from = match &self.job {
+            Some(Job::Load { kind: LoadKind::Sheet, table: Some(t), .. }) => Some(t),
+            _ => doc.table.as_ref(),
+        };
+        let Some(i) = doc.tables.iter().position(|t| Some(t) == from) else { return };
+        let j = i.saturating_add_signed(by).min(doc.tables.len() - 1);
+        if j != i {
+            let name = doc.tables[j].clone();
+            self.switch_sheet(&name, ctx);
+        }
+    }
+
+    /// A sheet arrived from the file.
+    fn sheet_loaded(&mut self, loaded: Loaded, started: Instant, kind: LoadKind) {
+        let Some(doc) = &mut self.doc else { return };
+        let wanted = loaded.request.table.clone();
+        let Some(name) = loaded.table.clone().filter(|n| Some(n) == wanted.as_ref()) else {
+            let msg = format!(
+                "The {} '{}' is no longer in the file. Reload the file (F5) to see what it holds now.",
+                doc.noun(),
+                wanted.unwrap_or_default()
+            );
+            self.error(msg);
+            return;
+        };
+        let shape = loaded.df.shape();
+        let note = loaded.notes.join("; ");
+        self.loads += 1;
+        let incoming = Parked {
+            request: loaded.request,
+            history: History::new(loaded.df),
+            loaded_shape: shape,
+            load_time: started.elapsed(),
+            id: self.loads,
+            grid: grid::GridView::default(),
+            chart: None,
+            profiles: HashMap::new(),
+            profiles_for: None,
+        };
+        if kind == LoadKind::Reimport && doc.table.as_ref() != Some(&name) {
+            // The user moved to another sheet while this one was read again.
+            doc.parked.insert(name, incoming);
+            return;
+        }
+        self.show_sheet(name, incoming);
+        let secs = started.elapsed().as_secs_f32();
+        self.info(format!(
+            "Loaded {} rows × {} columns in {secs:.2} s{}",
+            fmt_int(shape.0),
+            shape.1,
+            if note.is_empty() { String::new() } else { format!(" — {note}") }
+        ));
+    }
+
+    /// Puts `incoming` on screen as the sheet `name`. The sheet that was on
+    /// screen is kept in memory with its steps, scroll position, selection,
+    /// statistics and chart, unless it is `name` itself being replaced.
+    fn show_sheet(&mut self, name: String, mut sheet: Parked) {
+        let Some(doc) = &mut self.doc else { return };
+        // Statistics still being computed are computed again on return.
+        let complete = self.profiles.len() >= doc.df().width();
+        // After these swaps `sheet` is the one that leaves the screen.
+        let old = doc.swap_sheet(name, &mut sheet);
+        let view = std::mem::replace(&mut sheet.grid, self.grid.take_view());
+        sheet.chart = Some(self.chart.swap(sheet.chart.take()));
+        std::mem::swap(&mut self.profiles, &mut sheet.profiles);
+        std::mem::swap(&mut self.profiles_for, &mut sheet.profiles_for);
+        if !complete {
+            sheet.profiles_for = None;
+        }
+        doc.park(old, sheet);
+        self.grid.restore_view(view);
+        // Results on their way belong to the sheet that left.
+        self.profile_gen.fetch_add(1, Ordering::Relaxed);
+        self.profile_rx = None;
+        // These belong to one table; history versions of two sheets can be equal.
+        self.preview = None;
+        self.value_filter = None;
+        self.form.column.clear();
+        self.form.columns.clear();
+        self.form.cast_check = None;
+        self.reveal_tab = true;
     }
 
     fn reload(&mut self, ctx: &egui::Context) {
@@ -485,7 +893,14 @@ impl App {
     fn save_as(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
         let stem = doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or("data".into());
-        let default_fmt = if doc.format.can_write() && doc.format != Format::Sqlite { doc.format } else { Format::Csv };
+        let default_fmt = if doc.format.can_write() && doc.format != Format::Sqlite {
+            doc.format
+        } else if doc.is_workbook() {
+            // An .xlsx holds all the sheets; any other format takes just one.
+            Format::Excel
+        } else {
+            Format::Csv
+        };
         let mut dlg = rfd::FileDialog::new()
             .set_title("Save as")
             .set_file_name(format!("{stem}.{}", default_fmt.extensions()[0]));
@@ -528,59 +943,78 @@ impl App {
             self.error("Apply or discard the preview before saving");
             return;
         }
-        let df = doc.df().clone();
-        let version = doc.history.version();
+        match &self.job {
+            // That save reports when it is done; a second one would write the same file.
+            Some(Job::Save { .. }) => return,
+            Some(Job::Load { .. }) => {
+                self.after_save = None;
+                self.error("Wait until the file has been read, then save again");
+                return;
+            }
+            None => {}
+        }
+        let scope = doc.save_scope(opts.format);
+        if scope == SaveScope::Sheet && same_file(&path, &doc.path) {
+            self.after_save = None;
+            let msg = format!(
+                "That would replace all {} {}s of {} with this one. Choose another file name.",
+                doc.tables.len(),
+                doc.noun(),
+                doc.name()
+            );
+            self.error(msg);
+            return;
+        }
         let (tx, rx) = channel();
         let ctx2 = ctx.clone();
         let p2 = path.clone();
-        let o2 = opts.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(io::save(&df, &p2, &o2));
-            ctx2.request_repaint();
-        });
-        self.job = Some(Job::Save { rx, path, opts, version });
+        let save = if scope == SaveScope::Workbook {
+            let (sheets, written) = doc.workbook_sheets();
+            let names = sheets.iter().map(|s| s.name.clone()).collect();
+            let source = doc.path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(io::save_workbook(&sheets, &source, &p2));
+                ctx2.request_repaint();
+            });
+            SaveJob { path, opts, scope, written, names }
+        } else {
+            let df = doc.df().clone();
+            let o2 = opts.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(io::save(&df, &p2, &o2));
+                ctx2.request_repaint();
+            });
+            let written = vec![(doc.table.clone(), doc.history.version())];
+            SaveJob { path, opts, scope, written, names: Vec::new() }
+        };
+        self.job = Some(Job::Save { rx, save });
     }
 
-    fn finish_save(&mut self, path: PathBuf, opts: SaveOptions, version: u64) {
-        let format = opts.format;
-        if let Some(doc) = &mut self.doc {
-            if doc.history.version() == version {
-                doc.history.mark_saved();
-            }
-            if path != doc.path {
-                // The document now lives in the new file.
-                doc.path = path.clone();
-                doc.format = format;
-                doc.request.path = path.clone();
-                doc.request.format = format;
-                if !format.is_delimited() {
-                    doc.csv = None;
-                }
-            }
-        }
+    fn finish_save(&mut self, save: SaveJob) {
+        let path = save.path.clone();
         self.settings.recent.retain(|p| p != &path);
-        self.settings.recent.insert(0, path.clone());
+        self.settings.recent.insert(0, path);
         self.settings.recent.truncate(MAX_RECENT);
-        let mut note = String::new();
+        // The file may have been closed while it was written.
         if let Some(doc) = &mut self.doc {
-            if format.is_delimited() {
-                if let Some(c) = &mut doc.csv {
-                    if !c.encoding.starts_with("UTF-8") {
-                        note = format!(" (as UTF-8 with BOM; the original was {})", c.encoding);
-                        c.encoding = "UTF-8";
-                    }
-                    c.separator = opts.separator;
-                    c.had_bom = opts.bom;
-                    c.decimal_comma = opts.decimal_comma;
+            let msg = doc.finish_save(save);
+            self.info(msg);
+        }
+    }
+
+    /// "Save" in the unsaved-changes prompt: saves, then goes on with `after`.
+    fn save_then(&mut self, after: After, ctx: &egui::Context) {
+        // A save writes the sheet on screen, or the whole workbook. So go to
+        // a sheet that still has unsaved changes if this one has none.
+        if let Some(doc) = &self.doc {
+            if !doc.history.is_dirty() {
+                if let Some(name) = doc.dirty_sheets().first().cloned() {
+                    self.switch_sheet(&name, ctx);
                 }
-                // The file on disk is now UTF-8 in DataVivid's own dialect, so a
-                // reload should detect it afresh rather than reuse old overrides.
-                doc.request.csv.encoding = TextEncoding::Auto;
-                doc.request.csv.separator = None;
-                doc.request.csv.decimal_comma = None;
             }
         }
-        self.info(format!("Saved {}{note}", path.display()));
+        self.after_save = Some(after);
+        self.save(ctx);
     }
 
     // ---- operations -------------------------------------------------------
@@ -1041,27 +1475,37 @@ impl App {
     fn poll_jobs(&mut self, ctx: &egui::Context) {
         let Some(job) = self.job.take() else { return };
         match job {
-            Job::Load { rx, path, started } => match rx.try_recv() {
-                Ok(Ok(loaded)) => self.finish_load(loaded, started),
+            Job::Load { rx, path, started, kind, serial, table } => match rx.try_recv() {
+                Ok(Ok(loaded)) => self.finish_load(loaded, started, kind, serial),
                 Ok(Err(e)) => self.error(format!("Could not open {}: {e:#}", path.display())),
-                Err(std::sync::mpsc::TryRecvError::Empty) => self.job = Some(Job::Load { rx, path, started }),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.job = Some(Job::Load { rx, path, started, kind, serial, table })
+                }
                 Err(_) => self.error("Loading failed unexpectedly"),
             },
-            Job::Save { rx, path, opts, version } => match rx.try_recv() {
+            Job::Save { rx, save } => match rx.try_recv() {
                 Ok(Ok(())) => {
-                    self.finish_save(path, opts, version);
+                    self.finish_save(save);
                     if let Some(a) = self.after_save.take() {
-                        self.continue_after(a, ctx);
+                        // Another sheet may still have changes (a save to a
+                        // file that holds one table), or the table changed
+                        // while it was written: ask again instead of going on.
+                        if self.unsaved_before(&a) {
+                            self.dialog = Some(Dialog::Discard(a));
+                        } else {
+                            self.continue_after(a, ctx);
+                        }
                     }
                 }
                 Ok(Err(e)) => {
                     self.after_save = None;
-                    self.error(format!("Could not save {}: {e:#}", path.display()))
+                    self.error(format!("Could not save {}: {e:#}", save.path.display()))
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.job = Some(Job::Save { rx, path, opts, version })
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.job = Some(Job::Save { rx, save }),
+                Err(_) => {
+                    self.after_save = None;
+                    self.error("Saving failed unexpectedly")
                 }
-                Err(_) => self.error("Saving failed unexpectedly"),
             },
         }
     }
@@ -1070,7 +1514,7 @@ impl App {
         let title = match &self.doc {
             Some(d) => format!(
                 "{}{} — DataVivid",
-                if d.history.is_dirty() { "● " } else { "" },
+                if d.is_dirty() { "● " } else { "" },
                 d.name()
             ),
             None => "DataVivid".into(),
@@ -1109,6 +1553,13 @@ impl App {
                 self.form.kind = OpKind::FindReplace;
                 self.settings.show_ops = true;
             }
+            // Next and previous sheet, as in Excel. Taken here, before the
+            // grid reads Page Down as "one page down".
+            let next = ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::PageDown)));
+            let prev = ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::PageUp)));
+            if next != prev && self.dialog.is_none() {
+                self.step_sheet(if next { 1 } else { -1 }, ctx);
+            }
         }
         if ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::NONE, Key::F5))) {
             self.reload(ctx);
@@ -1122,7 +1573,7 @@ impl App {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
-            if self.doc.as_ref().is_some_and(|d| d.history.is_dirty()) {
+            if self.unsaved_before(&After::Quit) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.dialog = Some(Dialog::Discard(After::Quit));
             }
@@ -1167,6 +1618,10 @@ impl eframe::App for App {
                     .default_size(300.0)
                     .size_range(140.0..=900.0)
                     .show(ui, |ui| self.chart_panel(ui));
+            }
+            // Directly under the grid, where Excel has its sheet tabs.
+            if self.doc.as_ref().is_some_and(|d| d.tables.len() > 1) {
+                egui::Panel::bottom("sheets").show(ui, |ui| self.sheet_tabs(ui, &ctx));
             }
         }
 
@@ -1253,7 +1708,7 @@ impl App {
                 ui.separator();
                 if ui.add_enabled(has_doc, egui::Button::new("Close file")).clicked() {
                     ui.close();
-                    if self.doc.as_ref().is_some_and(|d| d.history.is_dirty()) {
+                    if self.unsaved_before(&After::Close) {
                         self.dialog = Some(Dialog::Discard(After::Close));
                     } else {
                         self.close_doc();
@@ -1336,30 +1791,61 @@ impl App {
                     ui.close();
                 }
             });
+        });
+    }
 
-            // Right side: quick actions.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(doc) = &self.doc {
-                    if doc.tables.len() > 1 {
-                        let mut chosen = doc.table.clone().unwrap_or_default();
-                        let label = if doc.format == Format::Sqlite { "Table" } else { "Sheet" };
-                        egui::ComboBox::from_id_salt("table")
-                            .selected_text(&chosen)
-                            .show_ui(ui, |ui| {
-                                for t in &doc.tables {
-                                    ui.selectable_value(&mut chosen, t.clone(), t);
-                                }
-                            });
-                        ui.label(label);
-                        if Some(&chosen) != doc.table.as_ref() {
-                            let mut req = doc.request.clone();
-                            req.table = Some(chosen);
-                            self.request_open(req, ctx);
+    /// The sheets of a workbook (or tables of a database) as tabs under the
+    /// grid. A dot marks a sheet with unsaved changes.
+    fn sheet_tabs(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        let Some(doc) = &self.doc else { return };
+        let reading = match &self.job {
+            Some(Job::Load { kind: LoadKind::Sheet, table, .. }) => table.clone(),
+            _ => None,
+        };
+        let reveal = std::mem::take(&mut self.reveal_tab);
+        let label = |t: &String| {
+            let dirty = doc.sheet(Some(t.as_str())).is_some_and(|h| h.is_dirty());
+            if dirty { format!("● {t}") } else { t.clone() }
+        };
+        let mut go = None;
+        ui.horizontal(|ui| {
+            ui.menu_button(format!("{} {}s", doc.tables.len(), doc.noun()), |ui| {
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    for t in &doc.tables {
+                        if ui.selectable_label(doc.table.as_ref() == Some(t), label(t)).clicked() {
+                            go = Some(t.clone());
+                            ui.close();
                         }
                     }
-                }
+                });
+            })
+            .response
+            .on_hover_text(format!(
+                "List of all {}s. Ctrl+Page Down and Ctrl+Page Up go to the next and the previous one.",
+                doc.noun()
+            ));
+            ui.separator();
+            egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for t in &doc.tables {
+                        let active = doc.table.as_ref() == Some(t);
+                        if reading.as_ref() == Some(t) {
+                            ui.add(egui::Spinner::new().size(12.0));
+                        }
+                        let r = ui.selectable_label(active, label(t));
+                        if active && reveal {
+                            r.scroll_to_me(None);
+                        }
+                        if r.clicked() {
+                            go = Some(t.clone());
+                        }
+                    }
+                });
             });
         });
+        if let Some(name) = go {
+            self.switch_sheet(&name, ctx);
+        }
     }
 
     fn windows_menu(&mut self, ui: &mut Ui) {
@@ -1422,7 +1908,7 @@ impl App {
 
     fn continue_after(&mut self, after: After, ctx: &egui::Context) {
         match after {
-            After::Open(req) => self.start_load(req, ctx),
+            After::Load(req, kind) => self.start_load(req, kind, ctx),
             After::Close => self.close_doc(),
             After::Quit => {
                 self.allow_close = true;
@@ -1442,16 +1928,16 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if let Some(Job::Load { path, started, .. }) = &self.job {
+            if let Some(Job::Load { path, started, kind, table, .. }) = &self.job {
                 ui.spinner();
-                ui.label(format!(
-                    "Opening {} … {:.0} s",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    started.elapsed().as_secs_f32()
-                ));
-            } else if let Some(Job::Save { path, .. }) = &self.job {
+                let what = match (kind, table) {
+                    (LoadKind::Open, _) | (_, None) => path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    (_, Some(t)) => format!("'{t}'"),
+                };
+                ui.label(format!("Opening {what} … {:.0} s", started.elapsed().as_secs_f32()));
+            } else if let Some(Job::Save { save, .. }) = &self.job {
                 ui.spinner();
-                ui.label(format!("Saving {} …", path.file_name().unwrap_or_default().to_string_lossy()));
+                ui.label(format!("Saving {} …", save.path.file_name().unwrap_or_default().to_string_lossy()));
             } else if let Some(doc) = &self.doc {
                 let mut parts = vec![if doc.csv.is_some() { "Delimited text".to_string() } else { doc.format.label().to_string() }];
                 if let Some(csv) = &doc.csv {
@@ -1483,7 +1969,7 @@ impl App {
                 if let Some(doc) = &self.doc {
                     let df = self.preview.as_ref().map_or(doc.df(), |p| &p.df);
                     ui.label(format!("{} rows × {} columns", fmt_int(df.height()), df.width()));
-                    if doc.history.is_dirty() {
+                    if doc.is_dirty() {
                         ui.label(RichText::new("● modified").color(Color32::from_rgb(230, 160, 60)));
                     }
                     if let Some((r0, r1, c0, c1)) = self.grid.selection(df.height(), df.width()) {
@@ -2098,6 +2584,7 @@ impl App {
         let Some(doc) = &self.doc else { return };
         let df = doc.df().clone();
         let version = doc.history.version();
+        let table = doc.id;
         let names: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
         let sel = if self.grid.whole_rows {
             None
@@ -2105,7 +2592,7 @@ impl App {
             self.grid.selection(df.height().max(1), df.width()).map(|(_, _, c0, c1)| (c0, c1))
         };
         self.chart.follow_selection(&names, sel, version);
-        self.chart.update(&df, self.loads, version, ui.ctx());
+        self.chart.update(&df, table, version, ui.ctx());
         match self.chart.ui(ui, &df, self.preview.is_some()) {
             Some(chart::Action::Apply(op)) => {
                 if self.preview.is_some() {
@@ -2141,6 +2628,32 @@ impl App {
         };
         let sep_text = req.csv.separator.map(|b| (b as char).to_string()).unwrap_or_default();
         self.dialog = Some(Dialog::Import { req, preview, sep_text });
+    }
+
+    /// The text of the unsaved-changes prompt, and whether "discard" covers
+    /// more than one sheet.
+    fn unsaved_text(&self, after: &After) -> (String, bool) {
+        let single = ("The current file has changes that are not saved.".to_string(), false);
+        let Some(doc) = &self.doc else { return single };
+        if doc.tables.len() <= 1 {
+            return single;
+        }
+        let noun = doc.noun();
+        if matches!(after, After::Load(_, LoadKind::Reimport)) {
+            let name = doc.table.clone().unwrap_or_default();
+            return (format!("The {noun} '{name}' has changes that are not saved. Reading it again discards them."), false);
+        }
+        let dirty = doc.dirty_sheets();
+        match dirty.as_slice() {
+            [one] => (format!("The {noun} '{one}' has changes that are not saved."), false),
+            many => {
+                let mut list = many.iter().take(8).map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+                if many.len() > 8 {
+                    list.push_str(&format!(" and {} more", many.len() - 8));
+                }
+                (format!("{} {noun}s have changes that are not saved: {list}.", many.len()), true)
+            }
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -2183,6 +2696,7 @@ impl App {
                             ("Ctrl+C / Ctrl+V", "Copy / paste cells"),
                             ("Delete", "Clear selected cells"),
                             ("Ctrl+Arrows, Ctrl+Home/End", "Jump to edges"),
+                            ("Ctrl+Page Down / Page Up", "Next / previous sheet"),
                         ] {
                             ui.label(RichText::new(k).monospace());
                             ui.label(d);
@@ -2203,16 +2717,17 @@ impl App {
             }
             Dialog::Discard(after) => {
                 let mut choice = None;
+                let (text, several) = self.unsaved_text(&after);
                 let r = egui::Modal::new(Id::unique("discard")).show(ctx, |ui| {
                     ui.set_width(400.0);
                     ui.heading("Unsaved changes");
-                    ui.label("The current file has changes that are not saved.");
+                    ui.label(text);
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button(RichText::new("Save").strong()).clicked() {
                             choice = Some(0);
                         }
-                        if ui.button("Discard changes").clicked() {
+                        if ui.button(if several { "Discard all changes" } else { "Discard changes" }).clicked() {
                             choice = Some(1);
                         }
                         if ui.button("Cancel").clicked() {
@@ -2225,12 +2740,9 @@ impl App {
                 }
                 match choice {
                     Some(0) => {
-                        // Save first; the user repeats the action afterwards.
+                        // Save first; `after` follows when the file is written.
                         let a = after.clone();
-                        then = Some(Box::new(move |app, ctx| {
-                            app.after_save = Some(a);
-                            app.save(ctx);
-                        }));
+                        then = Some(Box::new(move |app, ctx| app.save_then(a, ctx)));
                     }
                     Some(1) => {
                         let a = after.clone();
@@ -2246,12 +2758,16 @@ impl App {
                     ui.set_width(460.0);
                     ui.heading("Save Excel workbook");
                     let sheets = self.doc.as_ref().map_or(1, |d| d.tables.len());
-                    ui.label(format!(
-                        "DataVivid writes plain values. Overwriting keeps only this sheet{}; formatting, formulas, \
-                         charts{} are lost.",
-                        if sheets > 1 { format!(" (the other {} sheet(s) are removed)", sheets - 1) } else { String::new() },
-                        if sheets > 1 { "" } else { " and other workbook features" }
-                    ));
+                    ui.label(if sheets > 1 {
+                        format!(
+                            "DataVivid writes plain values. Overwriting keeps all {sheets} sheets with their \
+                             values, but formatting, formulas, charts and other workbook features are lost."
+                        )
+                    } else {
+                        "DataVivid writes plain values. Overwriting keeps the values, but formatting, formulas, \
+                         charts and other workbook features are lost."
+                            .to_string()
+                    });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.button(RichText::new("Save as new file…").strong()).clicked() {
@@ -2362,7 +2878,11 @@ impl App {
                 match action {
                     Some(true) => {
                         let r = req.clone();
-                        then = Some(Box::new(move |app, ctx| app.request_open(r, ctx)));
+                        // In a workbook only this sheet is read again; the
+                        // others keep their changes.
+                        let several = self.doc.as_ref().is_some_and(|d| d.tables.len() > 1);
+                        let kind = if several { LoadKind::Reimport } else { LoadKind::Open };
+                        then = Some(Box::new(move |app, ctx| app.request_load(r, kind, ctx)));
                     }
                     Some(false) => {}
                     None => self.dialog = Some(Dialog::Import { req, preview, sep_text }),
@@ -2373,6 +2893,11 @@ impl App {
             f(self, ctx);
         }
     }
+}
+
+/// Whether two paths name the same file (also through a link or `..`).
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 // ---------------------------------------------------------------------------
@@ -2813,5 +3338,287 @@ mod tests {
         let rows = dataset_rows(&df, Path::new(""));
         assert_eq!(rows[2].value(), "1\t12.5%");
         assert!(dataset_text(&df, &rows).ends_with("Column\tType\tMissing\tMissing %\nt\ttext\t1\t25.0%\nx\tint64\t0\t0.0%\n"));
+    }
+
+    // ---- sheets of a workbook ------------------------------------------------
+
+    /// Three sheets: two tables and one that is only a title above a table.
+    fn workbook(path: &Path) {
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        for (name, rows) in [
+            ("Sales", vec![("North", 10.5), ("South", 20.0), ("West", 7.25)]),
+            ("Costs", vec![("Rent", 900.0), ("Power", 120.5)]),
+        ] {
+            let ws = wb.add_worksheet();
+            ws.set_name(name).unwrap();
+            ws.write_string(0, 0, "what").unwrap();
+            ws.write_string(0, 1, "amount").unwrap();
+            for (i, (what, amount)) in rows.iter().enumerate() {
+                ws.write_string(i as u32 + 1, 0, *what).unwrap();
+                ws.write_number(i as u32 + 1, 1, *amount).unwrap();
+            }
+        }
+        let ws = wb.add_worksheet();
+        ws.set_name("Notes").unwrap();
+        ws.write_string(1, 1, "Report 2026").unwrap();
+        ws.write_string(3, 1, "checked").unwrap();
+        ws.write_boolean(3, 2, true).unwrap();
+        wb.save(path).unwrap();
+    }
+
+    fn read(path: &Path, sheet: &str) -> Loaded {
+        let mut req = LoadRequest::new(path).unwrap();
+        req.table = Some(sheet.to_string());
+        io::load(req).unwrap()
+    }
+
+    fn sheet_of(loaded: Loaded, id: u64) -> Parked {
+        Parked {
+            loaded_shape: loaded.df.shape(),
+            history: History::new(loaded.df),
+            request: loaded.request,
+            load_time: Duration::ZERO,
+            id,
+            grid: grid::GridView::default(),
+            chart: None,
+            profiles: HashMap::new(),
+            profiles_for: None,
+        }
+    }
+
+    /// Opens a file as the app does, on one sheet.
+    fn open(path: &Path, sheet: &str) -> Doc {
+        let loaded = read(path, sheet);
+        let (tables, table) = (loaded.tables.clone(), loaded.table.clone());
+        let first = sheet_of(loaded, 1);
+        Doc {
+            path: path.to_path_buf(),
+            format: first.request.format,
+            request: first.request,
+            tables,
+            table,
+            csv: None,
+            history: first.history,
+            loaded_shape: first.loaded_shape,
+            load_time: first.load_time,
+            id: 1,
+            serial: 1,
+            parked: HashMap::new(),
+        }
+    }
+
+    /// Goes to another sheet as `App::switch_sheet` does: one that was open
+    /// comes back from memory, another is read from the file.
+    fn go(doc: &mut Doc, sheet: &str) {
+        let mut next = match doc.parked.remove(sheet) {
+            Some(parked) => parked,
+            None => sheet_of(read(&doc.path, sheet), 99),
+        };
+        let old = doc.swap_sheet(sheet.to_string(), &mut next);
+        doc.park(old, next);
+    }
+
+    fn edit(doc: &mut Doc, row: usize, text: &str) {
+        let op = Op::SetCells { column: "what".into(), rows: vec![row], values: vec![Some(text.into())] };
+        let df = op.apply(doc.df()).unwrap();
+        doc.history.push(op, df);
+    }
+
+    fn cell(df: &DataFrame, row: usize) -> String {
+        df.column("what").unwrap().str().unwrap().get(row).unwrap().to_string()
+    }
+
+    /// Saves as the app does, without the background thread.
+    fn save(doc: &mut Doc, path: &Path, format: Format) -> String {
+        let scope = doc.save_scope(format);
+        let opts = SaveOptions::for_format(format);
+        let job = if scope == SaveScope::Workbook {
+            let (sheets, written) = doc.workbook_sheets();
+            let names = sheets.iter().map(|s| s.name.clone()).collect();
+            io::save_workbook(&sheets, &doc.path, path).unwrap();
+            SaveJob { path: path.to_path_buf(), opts, scope, written, names }
+        } else {
+            io::save(doc.df(), path, &opts).unwrap();
+            let written = vec![(doc.table.clone(), doc.history.version())];
+            SaveJob { path: path.to_path_buf(), opts, scope, written, names: Vec::new() }
+        };
+        doc.finish_save(job)
+    }
+
+    #[test]
+    fn a_change_survives_a_switch_and_is_asked_about_from_any_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        workbook(&path);
+        let on_disk = std::fs::read(&path).unwrap();
+
+        let mut doc = open(&path, "Sales");
+        assert_eq!(doc.tables, ["Sales", "Costs", "Notes"]);
+        assert!(!doc.is_dirty());
+        edit(&mut doc, 0, "Nord");
+        go(&mut doc, "Costs");
+
+        // On the second sheet: nothing changed here, but the file has unsaved work.
+        assert_eq!(doc.table.as_deref(), Some("Costs"));
+        assert!(!doc.history.is_dirty());
+        assert!(doc.is_dirty());
+        assert_eq!(doc.dirty_sheets(), ["Sales"]);
+        // Switching wrote nothing, so "discard" at exit really discards it.
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        // Back on the first sheet the change and its undo step are there.
+        edit(&mut doc, 1, "Strom");
+        go(&mut doc, "Sales");
+        assert_eq!(cell(doc.df(), 0), "Nord");
+        assert!(doc.history.can_undo());
+        assert_eq!(doc.dirty_sheets(), ["Sales", "Costs"]);
+        doc.history.undo();
+        assert_eq!(cell(doc.df(), 0), "North");
+        assert_eq!(doc.dirty_sheets(), ["Costs"]);
+    }
+
+    #[test]
+    fn saving_a_workbook_writes_the_changes_of_every_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        workbook(&path);
+        let mut doc = open(&path, "Sales");
+        edit(&mut doc, 0, "Nord");
+        go(&mut doc, "Costs");
+        edit(&mut doc, 1, "Strom");
+
+        // Only the changed sheets come from memory; "Notes" was never opened.
+        let (sheets, written) = doc.workbook_sheets();
+        let from_memory: Vec<&str> = sheets.iter().filter(|s| s.df.is_some()).map(|s| s.name.as_str()).collect();
+        assert_eq!(from_memory, ["Sales", "Costs"]);
+        assert_eq!(written.len(), 2);
+
+        let msg = save(&mut doc, &path, Format::Excel);
+        assert!(msg.ends_with("with all 3 sheets"), "{msg}");
+        assert!(!doc.is_dirty());
+        assert!(doc.dirty_sheets().is_empty());
+        assert_eq!(cell(&read(&path, "Sales").df, 0), "Nord");
+        assert_eq!(cell(&read(&path, "Costs").df, 1), "Strom");
+        // The sheet nobody touched kept its cells where they were.
+        use calamine::{Data, Reader};
+        let mut wb = calamine::open_workbook_auto(&path).unwrap();
+        let notes = wb.worksheet_range("Notes").unwrap();
+        assert_eq!(notes.get_value((1, 1)), Some(&Data::String("Report 2026".into())));
+        assert_eq!(notes.get_value((3, 2)), Some(&Data::Bool(true)));
+
+        // Saved sheets are copied from the file next time, not written again.
+        let (sheets, written) = doc.workbook_sheets();
+        assert!(sheets.iter().all(|s| s.df.is_none()));
+        assert!(written.is_empty());
+    }
+
+    #[test]
+    fn save_as_moves_the_whole_workbook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        workbook(&path);
+        let on_disk = std::fs::read(&path).unwrap();
+        let mut doc = open(&path, "Sales");
+        edit(&mut doc, 0, "Nord");
+        go(&mut doc, "Costs");
+
+        let copy = dir.path().join("copy.xlsx");
+        save(&mut doc, &copy, Format::Excel);
+        assert_eq!(doc.path, copy);
+        assert!(!doc.is_dirty());
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+        // A sheet opened later, and one that was parked, come from the new file.
+        assert_eq!(doc.request.path, copy);
+        assert_eq!(doc.parked["Sales"].request.path, copy);
+        assert_eq!(read(&copy, "Notes").tables, ["Sales", "Costs", "Notes"]);
+        assert_eq!(cell(&read(&copy, "Sales").df, 0), "Nord");
+    }
+
+    #[test]
+    fn exporting_one_sheet_leaves_the_workbook_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        workbook(&path);
+        let on_disk = std::fs::read(&path).unwrap();
+        let mut doc = open(&path, "Sales");
+        edit(&mut doc, 0, "Nord");
+        go(&mut doc, "Costs");
+        edit(&mut doc, 1, "Strom");
+
+        // CSV holds one table: the sheet on screen.
+        assert_eq!(doc.save_scope(Format::Csv), SaveScope::Sheet);
+        let csv = dir.path().join("costs.csv");
+        let msg = save(&mut doc, &csv, Format::Csv);
+        assert!(msg.starts_with("Exported the sheet 'Costs'"), "{msg}");
+        assert_eq!(doc.path, path);
+        assert_eq!(doc.tables.len(), 3);
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+        // The other sheet's change is still unsaved, so leaving asks again.
+        assert_eq!(doc.dirty_sheets(), ["Sales"]);
+
+        // The workbook itself still lacks both changes; saving it writes both.
+        let (_, written) = doc.workbook_sheets();
+        assert_eq!(written.len(), 2);
+        save(&mut doc, &path, Format::Excel);
+        assert!(!doc.is_dirty());
+        assert_eq!(cell(&read(&path, "Costs").df, 1), "Strom");
+        assert_eq!(cell(&read(&path, "Sales").df, 0), "Nord");
+    }
+
+    #[test]
+    fn a_change_made_while_saving_is_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        workbook(&path);
+        let mut doc = open(&path, "Sales");
+        edit(&mut doc, 0, "Nord");
+        let (sheets, written) = doc.workbook_sheets();
+        let names = sheets.iter().map(|s| s.name.clone()).collect();
+        io::save_workbook(&sheets, &path, &path).unwrap();
+        // The user undoes the change before the save is recorded.
+        doc.history.undo();
+        let opts = SaveOptions::for_format(Format::Excel);
+        doc.finish_save(SaveJob { path: path.clone(), opts, scope: SaveScope::Workbook, written, names });
+        // The file says "Nord", the screen "North": that must not pass as saved.
+        assert!(doc.is_dirty());
+        assert_eq!(doc.workbook_sheets().1.len(), 1);
+    }
+
+    #[test]
+    fn sheets_follow_the_names_excel_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        workbook(&path);
+        let mut doc = open(&path, "Sales");
+        go(&mut doc, "Costs");
+        // As if the names came from an .ods, where Excel's rules don't apply.
+        doc.rename_sheets(vec!["Sales 2026".into(), "Costs".into(), "Notes".into()]);
+        assert_eq!(doc.tables, ["Sales 2026", "Costs", "Notes"]);
+        assert_eq!(doc.table.as_deref(), Some("Costs"));
+        assert!(doc.parked.contains_key("Sales 2026"));
+        assert_eq!(doc.parked["Sales 2026"].request.table.as_deref(), Some("Sales 2026"));
+    }
+
+    #[test]
+    fn a_single_table_saved_elsewhere_moves_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.xlsx");
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.write_string(0, 0, "what").unwrap();
+        ws.write_string(1, 0, "a").unwrap();
+        wb.save(&path).unwrap();
+        let mut doc = open(&path, "Sheet1");
+        doc.request.csv.skip_rows = 3;
+        edit(&mut doc, 0, "b");
+        assert_eq!(doc.save_scope(Format::Csv), SaveScope::Table);
+        let csv = dir.path().join("one.csv");
+        save(&mut doc, &csv, Format::Csv);
+        assert!(!doc.is_dirty());
+        assert_eq!(doc.path, csv);
+        // No sheet names and no skipped rows are carried over to the CSV.
+        assert!(doc.tables.is_empty() && doc.table.is_none() && doc.request.table.is_none());
+        assert_eq!(doc.request.csv.skip_rows, 0);
+        assert_eq!(cell(&io::load(doc.request.clone()).unwrap().df, 0), "b");
     }
 }

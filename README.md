@@ -127,9 +127,9 @@ desktops install by default (otherwise install `xdg-desktop-portal` plus
 | JSON Lines / NDJSON | `.jsonl` `.ndjson` | ✔ | ✔ |
 | Arrow IPC / Feather | `.arrow` `.feather` `.ipc` | ✔ | ✔ |
 | Apache Avro | `.avro` | ✔ | ✔ |
-| Excel | `.xlsx` `.xlsm` `.xlsb` `.xls` | ✔ (sheet picker) | ✔ `.xlsx` |
-| OpenDocument | `.ods` | ✔ (sheet picker) | – |
-| SQLite | `.sqlite` `.sqlite3` `.db` | ✔ (table picker) | ✔ new file |
+| Excel | `.xlsx` `.xlsm` `.xlsb` `.xls` | ✔ (sheet tabs) | ✔ `.xlsx`, all sheets |
+| OpenDocument | `.ods` | ✔ (sheet tabs) | – |
+| SQLite | `.sqlite` `.sqlite3` `.db` | ✔ (table tabs) | ✔ new file, one table |
 
 Delimited text is sniffed automatically: separator (`,` `;` tab `|`),
 encoding (UTF-8, UTF-8/16 with BOM, otherwise Windows-1252) and the European
@@ -139,8 +139,9 @@ were not UTF-8 are saved as UTF-8 with a BOM, so nothing is lost and Excel
 still shows special characters correctly.
 
 Excel, ODS and SQLite are imported as plain values. Saving an `.xlsx` in place
-asks first, because formatting, formulas and other sheets are not kept.
-SQLite databases are never overwritten in place (*Save* becomes *Save as*).
+asks first, because formatting, formulas and charts are not kept. All sheets
+are kept, with their values. SQLite databases are never overwritten in place
+(*Save* becomes *Save as*).
 
 ## Features
 
@@ -161,6 +162,14 @@ SQLite databases are never overwritten in place (*Save* becomes *Save as*).
   distinct value with its row count. Search, tick and untick, OK. A filtered
   column shows a funnel. Reopening the filter right after applying it edits
   that filter instead of adding another one, and *Clear filter* removes it.
+- **Sheets**: the sheets of a workbook (and the tables of a database) are
+  tabs under the grid; Ctrl+Page Down and Ctrl+Page Up go to the next and the
+  previous one. A sheet is read when you first open it and then stays in
+  memory with its changes, steps, scroll position and selection, so going
+  back to it is instant. Nothing is written until you save: a dot marks each
+  sheet with unsaved changes, closing asks about all of them, and *Discard*
+  drops all of them. Saving as `.xlsx` writes every sheet; CSV, Parquet and
+  the other single-table formats get the sheet on screen.
 - **Preview** any operation before applying it.
 - **Steps & undo**: every change is a step; undo/redo (Ctrl+Z/Ctrl+Y) or click
   a step to go back to it.

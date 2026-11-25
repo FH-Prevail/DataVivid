@@ -776,7 +776,22 @@ impl ChartState {
 
     /// Forgets the chart of the previous file; keeps the chosen settings.
     pub fn reset(&mut self) {
-        *self = ChartState { agg: self.agg, period: self.period, bins: self.bins, ..Default::default() };
+        self.swap(None);
+    }
+
+    /// Shows the chart of another sheet and returns the one that was on
+    /// screen, to keep with its sheet. `None` is a sheet without a chart
+    /// yet; it starts with the settings in use.
+    pub fn swap(&mut self, other: Option<ChartState>) -> ChartState {
+        let mut next = other.unwrap_or_else(|| ChartState {
+            agg: self.agg,
+            period: self.period,
+            bins: self.bins,
+            ..Default::default()
+        });
+        // A plot number of its own, so it never takes over another chart's zoom.
+        next.generation = self.generation.max(next.generation) + 1;
+        std::mem::replace(self, next)
     }
 
     /// Starts a computation if the chart is out of date and collects results.

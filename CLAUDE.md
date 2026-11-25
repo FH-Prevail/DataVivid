@@ -14,7 +14,68 @@ User-facing documentation is in `README.md`.
   "Open with" or default app. Linux is supported since 2026-11-23 (same
   single binary, XDG registration); macOS is planned (see README).
 
-## Status (v0.1.4, 2026-11-24)
+## Status (v0.1.5, 2026-11-25)
+
+v0.1.5 (asked for by Sina) makes multi-sheet files workable. It is on `main`
+but **not tagged or released yet**.
+
+- **Sheet tabs:** a `Panel::bottom("sheets")` right under the grid
+  (`App::sheet_tabs`), shown when the file has more than one sheet (Excel,
+  ODS) or table (SQLite). It replaces the dropdown in the menu bar.
+  Ctrl+Page Down / Ctrl+Page Up step through the sheets (`App::step_sheet`,
+  consumed in `shortcuts()` before the grid sees Page Down). The button at
+  the left lists all sheets.
+- **Sheets stay in memory:** `Doc` holds the sheet on screen in its own
+  fields and the other opened sheets in `Doc::parked` (`Parked`: history,
+  load request, grid view, chart, profiles). `App::show_sheet` swaps them, so
+  going back is instant and keeps steps, scroll, selection, statistics and
+  chart. A sheet is read from the file on its first visit
+  (`LoadKind::Sheet`, in the background, the old sheet stays on screen).
+  **Nothing is written to disk on a switch.**
+- **Unsaved changes are per file, not per sheet:** `Doc::is_dirty()` and
+  `App::unsaved_before(&After)` look at all sheets. Title, status bar, Close,
+  Open, Reload and Exit use them; the prompt names the sheets
+  (`App::unsaved_text`) and "Discard all changes" drops every sheet's
+  changes. "Save" in the prompt goes to a sheet with unsaved changes first
+  (`App::save_then`), and after the save the prompt comes back if something
+  is still unsaved.
+- **What a save writes** (`Doc::save_scope` -> `SaveScope`):
+  - `Workbook`: Excel/ODS file with several sheets saved as `.xlsx`. All
+    sheets are written by `io::save_workbook`: sheets that differ from the
+    file come from memory, the others (also never-opened and hidden ones)
+    are copied cell by cell from the source file (`copy_cells`), at their
+    original positions. The document moves to the written file.
+  - `Sheet`: a file with several sheets saved to any other format (and every
+    save of a multi-table SQLite file). Only the sheet on screen is written,
+    the document stays where it is, and the sheet counts as saved
+    (`History::mark_exported`) although the workbook lacks the change.
+    Saving one table over the SQLite file it came from is refused.
+  - `Table`: a file with one table, as before.
+- **`History` has two marks:** `saved_at` (last save or export, for the
+  prompt) and `file_at` (what the file itself holds, for deciding whether a
+  workbook save copies the sheet from the file). `mark_unsaved()` clears
+  both when a table changed while its file was being written.
+- **Import options** in a multi-sheet file read only the sheet on screen
+  again (`LoadKind::Reimport`); the other sheets keep their changes.
+- **Also fixed:** chart/macro/dialog sheets are no longer listed
+  (`io::worksheet_names`); after a save, `skip_rows` and `has_header` of the
+  request are reset, because the written file starts with a header row; a
+  single sheet saved as CSV loses its old sheet name; a second Ctrl+S while
+  a save runs is ignored.
+- **Tested:** 36 unit tests pass (11 new: sheet switching, dirty state,
+  workbook save, export, rename, save-while-editing, raw copy of untouched
+  and hidden sheets). GUI tested on Linux in a container with a virtual
+  display (see Testing): tabs, keyboard switching, a 120,000-row sheet,
+  30 sheets, the exit prompt from an untouched third sheet, Save and Discard
+  from that prompt (file checked with openpyxl and by hash), Import options
+  on one sheet, a two-table SQLite file. Not tested: the Save As file dialog
+  with a multi-sheet file (no portal in the container), ODS and `.xls`
+  sources by hand, and Windows.
+- **Limits:** `--convert` has no sheet option (first sheet only). SQLite is
+  still written as a new file with one table. Sheets are read one at a time,
+  each read opens the workbook again.
+
+### v0.1.4 (2026-11-24)
 
 v0.1.4 adds the chart panel (`chart.rs`, egui_plot 0.38), step 1 of the
 plan agreed with Sina:
@@ -280,11 +341,11 @@ Not done or known gaps:
 | Module | Responsibility |
 |---|---|
 | `main.rs` | CLI flags (`--register/--unregister/--status/--convert/--help/--version`), else starts the GUI with an optional file path. Release builds use `windows_subsystem = "windows"`; CLI output works via `AttachConsole`. |
-| `app.rs` | eframe `App`: menu bar, left panel (Operations form + Steps list), right panel (column summary / dataset summary), central grid, modal dialogs (Import options, Unsaved changes, Excel overwrite, About), background jobs (load, save, profiling) via `std::thread` + `mpsc`. Settings (recent files, theme, panels) persisted via eframe storage (`%APPDATA%\DataVivid\data\app.ron`). |
+| `app.rs` | eframe `App`: menu bar, left panel (Operations form + Steps list), right panel (column summary / dataset summary), central grid, sheet tabs, modal dialogs (Import options, Unsaved changes, Excel overwrite, About), background jobs (load, save, profiling) via `std::thread` + `mpsc`. `Doc` is the open file: the sheet on screen plus the `parked` sheets, with the save bookkeeping (`save_scope`, `workbook_sheets`, `finish_save`), which is unit tested without a window. Settings (recent files, theme, panels) persisted via eframe storage (`%APPDATA%\DataVivid\data\app.ron`). |
 | `grid.rs` | Custom-painted virtualised grid (no egui_extras). Vertical scroll is tracked in **rows** (`top_row: f64`), not pixels, because f32 pixel offsets break beyond ~700k rows. Own scrollbars, selection (cell/range/whole columns/whole rows), inline `TextEdit` editor, keyboard nav, Excel-compatible TSV copy/paste, context menus. Returns `GridAction`s to the app. |
 | `ops.rs` | `Op` enum. Every data change (including cell edits and pastes) is an `Op` with `describe()` and `apply(&DataFrame) -> Result<DataFrame>`. `Op::Batch` groups multi-column changes. `SetCells` builds a full-length mask and value column and uses `when/then/otherwise`, so it validates types strictly. |
-| `history.rs` | Undo/redo as a list of `(Op, DataFrame-after)` snapshots. This is cheap because Polars columns are Arc-shared. It keeps at most 200 steps, folding the oldest into the base. `version()` increments on every change and drives cache invalidation. It tracks the dirty state against the saved cursor. |
-| `io.rs` | `load(LoadRequest) -> Loaded` and `save(df, path, SaveOptions)`. See the delimited-text, spreadsheet and SQLite notes below this table. |
+| `history.rs` | Undo/redo as a list of `(Op, DataFrame-after)` snapshots. This is cheap because Polars columns are Arc-shared. It keeps at most 200 steps, folding the oldest into the base. `version()` increments on every change and drives cache invalidation. It tracks the dirty state against two cursors: the last save or export (`is_dirty`) and what the file itself holds (`differs_from_file`). |
+| `io.rs` | `load(LoadRequest) -> Loaded`, `save(df, path, SaveOptions)` for one table and `save_workbook(&[SheetOut], source, path)` for all sheets of an `.xlsx`. See the delimited-text, spreadsheet and SQLite notes below this table. |
 | `chart.rs` | Chart panel. `compute(df, Request) -> ChartData` picks the chart from the column kinds (`Kind::{Number, Time, Category, Other}`) and aggregates before drawing: histogram (two passes, no copy), counts (Polars group_by, top 24 + Other, missing always its own bar), groups (Polars group_by; quantiles only for the box plot), over time (dates bucketed in Rust with Hinnant's civil-date math, running totals per period, values kept only for the median), scatter (seeded reservoir sample of `MAX_POINTS` = 50,000, Welford correlation). `ChartState` runs one background computation at a time (Polars can't cancel); `Request` holds `doc` (load counter) + history version + settings, and a stale chart is faded and not clickable. Horizontal category charts and vertical bars draw their own pointer tooltips (`category_plot`, `column_bars`) because egui_plot puts hover labels at the bar end, where they get cut off. Click on a category bar/box returns `Action::Apply(Op::FilterValues)`. `to_tsv` copies with `exact()` (round-trip) numbers; `num()` is the short display form. |
 | `stats.rs` | `ColumnProfile`: missing, distinct, quantiles, mean/std, histogram (one bin per value for small integer ranges), top values, min/max, text length. Computed in a background thread per history version, selected column first; stale runs cancel via an `AtomicU64` generation. |
 | `formats.rs` | Format enum ↔ extensions, labels, ProgID keys, `can_write`. |
@@ -306,6 +367,12 @@ Not done or known gaps:
 - **SQLite:** read-only via rusqlite.
 - **Writers:**
   - Excel uses rust_xlsxwriter and is limited to 1,048,575 rows.
+  - `save_workbook` writes every sheet into a new `.xlsx`: a `SheetOut` with
+    a table is written like a single sheet (bold header row, typed values),
+    one without is copied from the source workbook with calamine, value by
+    value. The source is read before the target is replaced, so both may be
+    the same file. `xlsx_sheet_names` makes names Excel accepts (ODS allows
+    more); the app renames its sheets to match after the save.
   - SQLite always writes a new file with one table.
   - Every save goes to a temporary sibling `.<name>.datavivid-tmp` first, then
     is renamed over the target.
@@ -379,6 +446,21 @@ Other crates:
 - **encoding_rs:** `decode_without_bom_handling` returns `(Cow<str>, bool)`.
 
 ## Testing
+
+GUI tests on Linux when the laptop screen is locked (2026-11-25: it was, so
+`DISPLAY=:0` only shows the lock screen; never type into it): run the dev
+binary in a `fedora:43` container with a virtual display.
+
+- `podman run -d --security-opt label=disable -v <scratch>:/work fedora:43 sleep infinity`,
+  then `dnf install` `xorg-x11-server-Xvfb mesa-dri-drivers mesa-libGL
+  mesa-libEGL libxkbcommon-x11 libXcursor libXi libXrandr xdotool
+  ImageMagick openbox dejavu-sans-fonts`. `label=disable` avoids the `:Z`
+  relabeling problem noted under Release procedure.
+- In it: `Xvfb :99 -screen 0 1400x900x24`, `openbox`, then the binary with
+  `DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1 XDG_DATA_HOME=/work/xdg`. Drive it
+  with `xdotool` (`key ctrl+Next`, `mousemove X Y click 1`, `key alt+F4`
+  for the close button) and take screenshots with `import -window root`.
+- File dialogs do not open there (no XDG portal), so Save As can't be driven.
 
 ```powershell
 cargo test                                          # unit tests
@@ -472,5 +554,6 @@ Notes:
    the grid reading slices.
 4. Export the steps as Python (pandas/Polars) code; Ops are already a
    replayable recipe.
-5. Group-by, pivot, and join/merge UIs. Charts step 2/3 (planned with Sina, 2026-11-24): click a histogram bin or a period to filter a range; correlation heatmap; missing-values map; save a chart as PNG; break lines across empty periods.
-6. Code-sign the setup and exe (SmartScreen); smaller exe (fat LTO, trimming Polars features).
+5. Sheets: a `--sheet` option for `--convert`; write all tables of a SQLite file; add, rename and delete sheets.
+6. Group-by, pivot, and join/merge UIs. Charts step 2/3 (planned with Sina, 2026-11-24): click a histogram bin or a period to filter a range; correlation heatmap; missing-values map; save a chart as PNG; break lines across empty periods.
+7. Code-sign the setup and exe (SmartScreen); smaller exe (fat LTO, trimming Polars features).

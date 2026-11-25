@@ -18,8 +18,12 @@ pub struct History {
     steps: Vec<Step>,
     /// Number of applied steps (steps after it are redo-able).
     cursor: usize,
-    /// Cursor value at the last save; `None` if that state was dropped.
+    /// Cursor value at the last save or export; `None` if that state was dropped.
     saved_at: Option<usize>,
+    /// Cursor value of the table the file itself holds. Exporting one sheet
+    /// of a workbook to another file moves `saved_at` only, so a later save
+    /// of the workbook still writes that sheet.
+    file_at: Option<usize>,
     /// Bumped on every change, so caches know when to refresh.
     version: u64,
     /// Steps folded into `base` because of `MAX_STEPS`.
@@ -28,7 +32,7 @@ pub struct History {
 
 impl History {
     pub fn new(df: DataFrame) -> Self {
-        History { base: df, steps: Vec::new(), cursor: 0, saved_at: Some(0), version: 0, folded: 0 }
+        History { base: df, steps: Vec::new(), cursor: 0, saved_at: Some(0), file_at: Some(0), version: 0, folded: 0 }
     }
 
     pub fn current(&self) -> &DataFrame {
@@ -40,10 +44,12 @@ impl History {
     }
 
     pub fn push(&mut self, op: Op, df: DataFrame) {
-        self.steps.truncate(self.cursor);
-        if let Some(s) = self.saved_at {
-            if s > self.cursor {
-                self.saved_at = None;
+        // The redo steps go, and with them a saved state among them.
+        let cursor = self.cursor;
+        self.steps.truncate(cursor);
+        for mark in [&mut self.saved_at, &mut self.file_at] {
+            if mark.is_some_and(|s| s > cursor) {
+                *mark = None;
             }
         }
         self.steps.push(Step { op, df });
@@ -53,10 +59,12 @@ impl History {
             self.base = first.df;
             self.cursor -= 1;
             self.folded += 1;
-            self.saved_at = match self.saved_at {
-                Some(0) | None => None,
-                Some(s) => Some(s - 1),
-            };
+            for mark in [&mut self.saved_at, &mut self.file_at] {
+                *mark = match *mark {
+                    Some(0) | None => None,
+                    Some(s) => Some(s - 1),
+                };
+            }
         }
         self.version += 1;
     }
@@ -111,11 +119,30 @@ impl History {
         self.folded
     }
 
+    /// Changes that are in no file yet; the user is asked before they go.
     pub fn is_dirty(&self) -> bool {
-        self.saved_at != Some(self.cursor)
+        let now = Some(self.cursor);
+        self.saved_at != now && self.file_at != now
     }
+    /// The table is not what the file it belongs to holds.
+    pub fn differs_from_file(&self) -> bool {
+        self.file_at != Some(self.cursor)
+    }
+    /// The file itself now holds this table.
     pub fn mark_saved(&mut self) {
         self.saved_at = Some(self.cursor);
+        self.file_at = Some(self.cursor);
+    }
+    /// This table was written to another file, as one sheet of a workbook.
+    pub fn mark_exported(&mut self) {
+        self.saved_at = Some(self.cursor);
+    }
+    /// The file was written with a table that is no longer the current one
+    /// (it changed while the file was being written), so no step is known
+    /// to be in the file.
+    pub fn mark_unsaved(&mut self) {
+        self.saved_at = None;
+        self.file_at = None;
     }
 }
 
@@ -158,5 +185,33 @@ mod tests {
         assert!(h.is_dirty());
         h.jump_to(2);
         assert_eq!(val(&h), 9);
+    }
+
+    #[test]
+    fn export_is_saved_but_not_in_the_file() {
+        let mut h = History::new(df(0));
+        assert!(!h.differs_from_file());
+        h.push(op(), df(1));
+        h.mark_exported();
+        // Nothing to ask about, but the workbook still lacks the change.
+        assert!(!h.is_dirty());
+        assert!(h.differs_from_file());
+        // Back to what the file holds: neither.
+        h.undo();
+        assert!(!h.is_dirty());
+        assert!(!h.differs_from_file());
+        h.redo();
+        h.push(op(), df(2));
+        assert!(h.is_dirty());
+        h.mark_saved();
+        assert!(!h.is_dirty());
+        assert!(!h.differs_from_file());
+        // A new change after going back drops the saved state for good.
+        h.undo();
+        h.undo();
+        h.push(op(), df(7));
+        h.undo();
+        assert!(h.is_dirty());
+        assert!(h.differs_from_file());
     }
 }

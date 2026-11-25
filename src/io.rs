@@ -389,7 +389,7 @@ pub fn preview_text(path: &Path, encoding: TextEncoding, max_lines: usize) -> Re
 fn read_spreadsheet(path: &Path, sheet: Option<&str>, opts: &CsvOptions) -> Result<(DataFrame, Vec<String>, String)> {
     use calamine::{Data, Reader, open_workbook_auto};
     let mut wb = open_workbook_auto(path).with_context(|| format!("Opening {}", path.display()))?;
-    let sheets = wb.sheet_names();
+    let sheets = worksheet_names(&wb);
     if sheets.is_empty() {
         bail!("The workbook has no sheets");
     }
@@ -418,6 +418,18 @@ fn read_spreadsheet(path: &Path, sheet: Option<&str>, opts: &CsvOptions) -> Resu
     }
     let df = DataFrame::new(body.len(), columns)?;
     Ok((df, sheets, name))
+}
+
+/// The sheets that hold cells. Chart, macro and dialog sheets have none, so
+/// they are left out of the tabs (and are not kept when the workbook is saved).
+fn worksheet_names<R: calamine::Reader<std::io::BufReader<File>>>(wb: &R) -> Vec<String> {
+    let names: Vec<String> = wb
+        .sheets_metadata()
+        .iter()
+        .filter(|s| s.typ == calamine::SheetType::WorkSheet)
+        .map(|s| s.name.clone())
+        .collect();
+    if names.is_empty() { wb.sheet_names() } else { names }
 }
 
 fn cell_to_string(d: &calamine::Data) -> String {
@@ -676,10 +688,33 @@ pub fn save(df: &DataFrame, path: &Path, opts: &SaveOptions) -> Result<()> {
     if !opts.format.can_write() {
         bail!("{} files can't be written; use Save As with another format", opts.format.label());
     }
+    replace_file(path, |tmp| write_to(df, tmp, opts))
+}
+
+/// One sheet of a workbook to write.
+pub struct SheetOut {
+    /// Its name in the written file.
+    pub name: String,
+    /// Its name in the workbook it comes from.
+    pub source: String,
+    /// The table to write. `None` copies the cell values from the source
+    /// workbook as they are, which is right for a sheet nobody changed: no
+    /// row is taken for a header and no column is forced into one type.
+    pub df: Option<DataFrame>,
+}
+
+/// Writes all sheets as one `.xlsx` that replaces `path`, in the same safe
+/// way as [`save`]. `source` is the workbook the unchanged sheets are copied
+/// from; it may be `path` itself.
+pub fn save_workbook(sheets: &[SheetOut], source: &Path, path: &Path) -> Result<()> {
+    replace_file(path, |tmp| write_workbook(sheets, source, tmp))
+}
+
+/// Runs `write` on a temporary sibling of `path`, then moves it over `path`.
+fn replace_file(path: &Path, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
     let file_name = path.file_name().ok_or_else(|| anyhow!("Invalid file name"))?;
     let tmp = path.with_file_name(format!(".{}.datavivid-tmp", file_name.to_string_lossy()));
-    let result = write_to(df, &tmp, opts);
-    if let Err(e) = result {
+    if let Err(e) = write(&tmp) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -734,8 +769,123 @@ fn write_to(df: &DataFrame, path: &Path, opts: &SaveOptions) -> Result<()> {
 const XLSX_MAX_ROWS: usize = 1_048_575; // plus the header row
 const XLSX_MAX_COLS: usize = 16_384;
 
+/// Cell formats shared by the sheets of one written workbook.
+struct XlsxFormats {
+    bold: rust_xlsxwriter::Format,
+    date: rust_xlsxwriter::Format,
+    datetime: rust_xlsxwriter::Format,
+    duration: rust_xlsxwriter::Format,
+}
+
+impl XlsxFormats {
+    fn new() -> Self {
+        use rust_xlsxwriter::Format as XFormat;
+        XlsxFormats {
+            bold: XFormat::new().set_bold(),
+            date: XFormat::new().set_num_format("yyyy-mm-dd"),
+            datetime: XFormat::new().set_num_format("yyyy-mm-dd hh:mm:ss"),
+            duration: XFormat::new().set_num_format("[h]:mm:ss"),
+        }
+    }
+}
+
+/// Makes sheet names Excel accepts: at most 31 characters, none of
+/// `[]:*?/\`, no apostrophe at either end, not empty, and no two alike
+/// (Excel ignores case). Names that are fine already come back unchanged.
+pub fn xlsx_sheet_names(names: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let clean: String = name.chars().filter(|c| !"[]:*?/\\\0".contains(*c)).collect();
+            let clean = clip_utf16(clean.trim_matches('\''), 31);
+            // Clipping may leave an apostrophe at the end again.
+            let clean = clean.trim_end_matches('\'');
+            let base = if clean.is_empty() { format!("Sheet{}", i + 1) } else { clean.to_string() };
+            let mut cand = base.clone();
+            let mut k = 2;
+            while !seen.insert(cand.to_lowercase()) {
+                let suffix = format!("_{k}");
+                cand = clip_utf16(&base, 31 - suffix.len()) + &suffix;
+                k += 1;
+            }
+            cand
+        })
+        .collect()
+}
+
+/// The start of `s` that fits in `max` UTF-16 units, which is how Excel
+/// counts the length of a sheet name.
+fn clip_utf16(s: &str, max: usize) -> String {
+    let mut len = 0;
+    s.chars()
+        .take_while(|c| {
+            len += c.len_utf16();
+            len <= max
+        })
+        .collect()
+}
+
 fn write_xlsx(df: &DataFrame, path: &Path, sheet: &str) -> Result<()> {
-    use rust_xlsxwriter::{Format as XFormat, Workbook};
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.set_name(&xlsx_sheet_names(&[sheet.to_string()])[0])?;
+    write_table(ws, df, &XlsxFormats::new())?;
+    wb.save(path)?;
+    Ok(())
+}
+
+fn write_workbook(sheets: &[SheetOut], source: &Path, path: &Path) -> Result<()> {
+    use calamine::{Reader, SheetVisible, open_workbook_auto};
+    // The source is read in full before `path` is written, and it is closed
+    // when this function returns, so `source` and the final file may be the
+    // same one.
+    let mut src = match open_workbook_auto(source) {
+        Ok(wb) => Some(wb),
+        Err(e) if sheets.iter().any(|s| s.df.is_none()) => {
+            return Err(e).with_context(|| format!("Reading the other sheets from {}", source.display()));
+        }
+        Err(_) => None,
+    };
+    let hidden: Vec<bool> = sheets
+        .iter()
+        .map(|s| {
+            src.as_ref().is_some_and(|wb| {
+                wb.sheets_metadata().iter().any(|m| m.name == s.source && m.visible != SheetVisible::Visible)
+            })
+        })
+        .collect();
+    // Excel needs a visible sheet to open on.
+    let first_visible = hidden.iter().position(|h| !h);
+
+    let formats = XlsxFormats::new();
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    for (i, sheet) in sheets.iter().enumerate() {
+        let ws = wb.add_worksheet();
+        ws.set_name(&sheet.name)?;
+        match (&sheet.df, &mut src) {
+            (Some(df), _) => write_table(ws, df, &formats).with_context(|| format!("Sheet '{}'", sheet.name))?,
+            (None, Some(src)) => {
+                let range = src
+                    .worksheet_range(&sheet.source)
+                    .with_context(|| format!("Reading sheet '{}' from {}", sheet.source, source.display()))?;
+                copy_cells(ws, &range, &formats).with_context(|| format!("Sheet '{}'", sheet.name))?;
+            }
+            (None, None) => unreachable!("the source was opened for the sheets that are copied"),
+        }
+        if hidden[i] && first_visible.is_some() {
+            ws.set_hidden(true);
+        } else if first_visible == Some(i) && i > 0 {
+            ws.set_active(true);
+        }
+    }
+    wb.save(path)?;
+    Ok(())
+}
+
+/// Writes a table as a sheet: a bold header row, then typed values.
+fn write_table(ws: &mut rust_xlsxwriter::Worksheet, df: &DataFrame, formats: &XlsxFormats) -> Result<()> {
     if df.height() > XLSX_MAX_ROWS || df.width() > XLSX_MAX_COLS {
         bail!(
             "Excel sheets hold at most {XLSX_MAX_ROWS} rows and {XLSX_MAX_COLS} columns; this table has {} x {}",
@@ -743,17 +893,9 @@ fn write_xlsx(df: &DataFrame, path: &Path, sheet: &str) -> Result<()> {
             df.width()
         );
     }
-    let mut wb = Workbook::new();
-    let ws = wb.add_worksheet();
-    let sheet: String = sheet.chars().filter(|c| !"[]:*?/\\".contains(*c)).take(31).collect();
-    ws.set_name(if sheet.is_empty() { "Sheet1" } else { &sheet })?;
-    let bold = XFormat::new().set_bold();
-    let date_fmt = XFormat::new().set_num_format("yyyy-mm-dd");
-    let dt_fmt = XFormat::new().set_num_format("yyyy-mm-dd hh:mm:ss");
-
     for (ci, col) in df.columns().iter().enumerate() {
         let c = ci as u16;
-        ws.write_string_with_format(0, c, col.name().as_str(), &bold)?;
+        ws.write_string_with_format(0, c, col.name().as_str(), &formats.bold)?;
         let dtype = col.dtype().clone();
         let series = col.as_materialized_series();
         if dtype.is_primitive_numeric() {
@@ -776,7 +918,7 @@ fn write_xlsx(df: &DataFrame, path: &Path, sheet: &str) -> Result<()> {
             let ms = series
                 .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?
                 .cast(&DataType::Int64)?;
-            let fmt = if dtype == DataType::Date { &date_fmt } else { &dt_fmt };
+            let fmt = if dtype == DataType::Date { &formats.date } else { &formats.datetime };
             for (ri, v) in ms.i64()?.iter().enumerate() {
                 if let Some(v) = v {
                     let serial = v as f64 / 86_400_000.0 + 25569.0;
@@ -794,7 +936,55 @@ fn write_xlsx(df: &DataFrame, path: &Path, sheet: &str) -> Result<()> {
         }
     }
     ws.set_freeze_panes(1, 0)?;
-    wb.save(path)?;
+    Ok(())
+}
+
+/// Copies the cell values of a sheet to the same cells of a new one.
+/// Formulas arrive as their last results; formatting is not copied.
+fn copy_cells(
+    ws: &mut rust_xlsxwriter::Worksheet,
+    range: &calamine::Range<calamine::Data>,
+    formats: &XlsxFormats,
+) -> Result<()> {
+    use calamine::Data;
+    let Some((row0, col0)) = range.start() else { return Ok(()) };
+    let (rows, cols) = range.get_size();
+    if row0 as usize + rows > XLSX_MAX_ROWS + 1 || col0 as usize + cols > XLSX_MAX_COLS {
+        bail!("Excel sheets hold at most {} rows and {XLSX_MAX_COLS} columns", XLSX_MAX_ROWS + 1);
+    }
+    for (r, c, cell) in range.used_cells() {
+        let (row, col) = (row0 + r as u32, (col0 as usize + c) as u16);
+        match cell {
+            Data::Empty => {}
+            Data::String(s) | Data::DateTimeIso(s) | Data::DurationIso(s) => {
+                ws.write_string(row, col, s)?;
+            }
+            Data::Float(f) if f.is_finite() => {
+                ws.write_number(row, col, *f)?;
+            }
+            Data::Float(_) => {}
+            Data::Int(i) => {
+                ws.write_number(row, col, *i as f64)?;
+            }
+            Data::Bool(b) => {
+                ws.write_boolean(row, col, *b)?;
+            }
+            Data::DateTime(dt) => {
+                let serial = dt.as_f64();
+                let fmt = if dt.is_duration() {
+                    &formats.duration
+                } else if serial.fract() == 0.0 {
+                    &formats.date
+                } else {
+                    &formats.datetime
+                };
+                ws.write_number_with_format(row, col, serial, fmt)?;
+            }
+            Data::Error(e) => {
+                ws.write_string(row, col, e.to_string())?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -904,6 +1094,129 @@ mod tests {
         for ext in ["csv", "tsv", "parquet", "json", "jsonl", "arrow", "avro", "xlsx", "sqlite"] {
             roundtrip(ext);
         }
+    }
+
+    /// A workbook as a user might have it: a plain table, a sheet whose
+    /// cells are no table at all, and a hidden sheet.
+    fn three_sheet_workbook(path: &Path) {
+        use rust_xlsxwriter::Workbook;
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.set_name("Sales").unwrap();
+        ws.write_string(0, 0, "region").unwrap();
+        ws.write_string(0, 1, "amount").unwrap();
+        for (i, (r, a)) in [("North", 10.5), ("South", 20.0), ("West", 7.25)].iter().enumerate() {
+            ws.write_string(i as u32 + 1, 0, *r).unwrap();
+            ws.write_number(i as u32 + 1, 1, *a).unwrap();
+        }
+        let ws = wb.add_worksheet();
+        ws.set_name("Notes").unwrap();
+        // Starts at C3, mixes text and numbers in one column, repeats a header.
+        ws.write_string(2, 2, "Report 2026").unwrap();
+        ws.write_string(4, 2, "x").unwrap();
+        ws.write_string(4, 3, "x").unwrap();
+        ws.write_number(5, 2, 1.0).unwrap();
+        ws.write_string(5, 3, "one").unwrap();
+        ws.write_string(6, 2, "n/a").unwrap();
+        ws.write_boolean(6, 3, true).unwrap();
+        let ws = wb.add_worksheet();
+        ws.set_name("Lookup").unwrap();
+        ws.write_string(0, 0, "code").unwrap();
+        ws.write_number(1, 0, 42.0).unwrap();
+        ws.set_hidden(true);
+        wb.save(path).unwrap();
+    }
+
+    fn sheet(path: &Path, name: &str) -> Loaded {
+        let mut req = LoadRequest::new(path).unwrap();
+        req.table = Some(name.to_string());
+        let l = load(req).unwrap();
+        assert_eq!(l.table.as_deref(), Some(name));
+        l
+    }
+
+    #[test]
+    fn saving_a_workbook_keeps_every_sheet() {
+        use calamine::{Data, Reader, SheetVisible, open_workbook_auto};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        three_sheet_workbook(&path);
+        assert_eq!(sheet(&path, "Sales").tables, ["Sales", "Notes", "Lookup"]);
+
+        // Change one sheet, as the app would, and save over the same file.
+        let edited = df!("region" => ["North", "South"], "amount" => [11.5f64, 20.0]).unwrap();
+        let out = |df: Option<DataFrame>, name: &str| SheetOut { name: name.into(), source: name.into(), df };
+        let sheets = [out(Some(edited), "Sales"), out(None, "Notes"), out(None, "Lookup")];
+        save_workbook(&sheets, &path, &path).unwrap();
+
+        let sales = sheet(&path, "Sales");
+        assert_eq!(sales.tables, ["Sales", "Notes", "Lookup"]);
+        assert_eq!(sales.df.shape(), (2, 2));
+        assert_eq!(sales.df.column("amount").unwrap().f64().unwrap().get(0), Some(11.5));
+
+        // The untouched sheets keep their cells where they were, with their types.
+        let mut wb = open_workbook_auto(&path).unwrap();
+        let notes = wb.worksheet_range("Notes").unwrap();
+        assert_eq!(notes.start(), Some((2, 2)));
+        assert_eq!(notes.get_value((2, 2)), Some(&Data::String("Report 2026".into())));
+        assert_eq!(notes.get_value((5, 2)), Some(&Data::Float(1.0)));
+        assert_eq!(notes.get_value((6, 2)), Some(&Data::String("n/a".into())));
+        assert_eq!(notes.get_value((6, 3)), Some(&Data::Bool(true)));
+        assert_eq!(notes.get_value((4, 3)), Some(&Data::String("x".into())));
+        let lookup = wb.sheets_metadata().iter().find(|s| s.name == "Lookup").unwrap();
+        assert_eq!(lookup.visible, SheetVisible::Hidden);
+        assert_eq!(sheet(&path, "Lookup").df.column("code").unwrap().i64().unwrap().get(0), Some(42));
+        // No temporary file is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_hidden_first_sheet_stays_hidden() {
+        use calamine::{Reader, SheetVisible, open_workbook_auto};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.set_name("Config").unwrap();
+        ws.write_string(0, 0, "key").unwrap();
+        ws.set_hidden(true);
+        let ws = wb.add_worksheet();
+        ws.set_name("Data").unwrap();
+        ws.write_string(0, 0, "x").unwrap();
+        ws.write_number(1, 0, 1.0).unwrap();
+        ws.set_active(true);
+        wb.save(&path).unwrap();
+
+        let out = |name: &str| SheetOut { name: name.into(), source: name.into(), df: None };
+        save_workbook(&[out("Config"), out("Data")], &path, &path).unwrap();
+        let wb = open_workbook_auto(&path).unwrap();
+        let visible: Vec<_> = wb.sheets_metadata().iter().map(|s| (s.name.as_str(), s.visible)).collect();
+        assert_eq!(visible, [("Config", SheetVisible::Hidden), ("Data", SheetVisible::Visible)]);
+        assert_eq!(sheet(&path, "Data").df.shape(), (1, 1));
+    }
+
+    #[test]
+    fn a_failed_workbook_save_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.xlsx");
+        three_sheet_workbook(&path);
+        let before = std::fs::read(&path).unwrap();
+        let sheets = [SheetOut { name: "Gone".into(), source: "Gone".into(), df: None }];
+        assert!(save_workbook(&sheets, &path, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sheet_names_for_excel() {
+        let names = |v: &[&str]| xlsx_sheet_names(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(names(&["Sales", "Q1 2026", "Übersicht"]), ["Sales", "Q1 2026", "Übersicht"]);
+        assert_eq!(names(&["a/b", "'quoted'", "", "data", "DATA"]), ["ab", "quoted", "Sheet3", "data", "DATA_2"]);
+        let long = "x".repeat(40);
+        let out = names(&[&long, &long]);
+        assert_eq!(out[0].len(), 31);
+        assert_eq!(out[1].len(), 31);
+        assert!(out[1].ends_with("_2"));
     }
 
     #[test]

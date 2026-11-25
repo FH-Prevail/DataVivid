@@ -90,10 +90,48 @@ pub struct GridState {
     request_focus: bool,
 }
 
+/// Scroll position and selection of a sheet that is not on screen.
+#[derive(Default)]
+pub struct GridView {
+    top_row: f64,
+    scroll_x: f32,
+    anchor: Option<Cell>,
+    cursor: Option<Cell>,
+    whole_cols: bool,
+    whole_rows: bool,
+}
+
 impl GridState {
     /// Clears selection and scroll position (new file).
     pub fn reset(&mut self) {
         *self = GridState { widths: std::mem::take(&mut self.widths), ..Default::default() };
+    }
+
+    /// Takes the scroll position and selection out, for a sheet that goes
+    /// off screen, and leaves the grid as for a new table.
+    pub fn take_view(&mut self) -> GridView {
+        let view = GridView {
+            top_row: self.top_row,
+            scroll_x: self.scroll_x,
+            anchor: self.anchor,
+            cursor: self.cursor,
+            whole_cols: self.whole_cols,
+            whole_rows: self.whole_rows,
+        };
+        self.reset();
+        view
+    }
+
+    /// Puts a sheet back where it was left, with the keyboard in the grid.
+    pub fn restore_view(&mut self, view: GridView) {
+        self.reset();
+        self.top_row = view.top_row;
+        self.scroll_x = view.scroll_x;
+        self.anchor = view.anchor;
+        self.cursor = view.cursor;
+        self.whole_cols = view.whole_cols;
+        self.whole_rows = view.whole_rows;
+        self.request_focus = true;
     }
 
     /// Keeps selection inside a table that changed shape.
