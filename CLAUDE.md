@@ -16,8 +16,7 @@ User-facing documentation is in `README.md`.
 
 ## Status (v0.1.5, 2026-11-25)
 
-v0.1.5 (asked for by Sina) makes multi-sheet files workable. It is on `main`
-but **not tagged or released yet**.
+v0.1.5 (asked for by Sina) makes multi-sheet files workable.
 
 - **Sheet tabs:** a `Panel::bottom("sheets")` right under the grid
   (`App::sheet_tabs`), shown when the file has more than one sheet (Excel,
@@ -74,6 +73,22 @@ but **not tagged or released yet**.
 - **Limits:** `--convert` has no sheet option (first sheet only). SQLite is
   still written as a new file with one table. Sheets are read one at a time,
   each read opens the workbook again.
+- **Published 2026-11-25:**
+  https://github.com/FH-Prevail/DataVivid/releases/tag/v0.1.5 (tag on
+  `2d3c03b`, run 45588267317, 19 min with the warm main cache).
+  - Before tagging, a manual run on `main` (45583462270) passed on Windows
+    and Linux.
+  - Anonymous downloads of all 5 files pass `sha256sum -c`.
+  - SHA-256:
+    - setup `e4f2c2fe797b1014b27a2b5add65d937d591ecd816a208dae3756f73c4b65ae3`
+    - zip `6db61a8eb0535b493f660c61cde2b3057ab2f1375fc0f5ae1792e33560df1332`
+    - exe `f703c42728822048877d8885be19126b48ffb0cc8af0256b559d77ded40f8dd0`
+    - tarball `966ff6c44ba5b8ff5c3bef1c46f84ef8635a653ea6a272657514395a4628118a`
+    - Linux binary `dd11ec55bc3b4d17187704b47d968d65d80147ee2c7f652779b6d30d714f4e34`
+  - The Linux laptop runs 0.1.5 from the tarball (`install.sh --no-default`;
+    `--version`, `--status` and `--convert` of an `.xlsx` checked). The GUI of
+    the released binary was not opened; the dev build of the same commit was
+    tested. The sheet tabs have not been tried on Windows by hand.
 
 ### v0.1.4 (2026-11-24)
 
